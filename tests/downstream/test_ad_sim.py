@@ -437,3 +437,68 @@ def test_checked_in_sim_config():
     assert sim["evaluation"] == {"label_availability_policy": "handoff_timestamp"}
     assert sim["foundation"] == {"init": "pretrained"}
     _validate_config(sim)
+
+
+def test_sim_run_with_candidate_attributes_exports_a_reloadable_head(sim_ads, small_ads, tmp_path):
+    from src.downstream.ad_optimization import load_ad_ranker_checkpoint
+
+    config = sim_config(sim_ads, tmp_path, root=small_ads)
+    config["export_model"] = True
+    config["model"].update(candidate_attributes=["category", "advertiser"], attribute_dim=3)
+    result = run_ad_optimization(config, real_services(config))
+    assert "roc_auc" in result["metrics"]
+    manifest = json.loads(Path(result["predictions_path"]).with_name(
+        "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["model_hyperparameters"]["candidate_attributes"] == ["category", "advertiser"]
+    ranker, _, payload = load_ad_ranker_checkpoint(
+        result["model_path"], expected_foundation_sha256=sha256_file(sim_ads.checkpoint),
+        expected_data_version=sim_ads.manifest["dataset_version"])
+    assert ranker.attribute_sizes == tuple(
+        len(payload["attribute_vocabularies"][name]) + 1 for name in ("category", "advertiser"))
+
+
+def test_sim_inputs_carry_ad_catalog_attribute_ids(sim_ads, small_ads, tmp_path):
+    config = sim_config(sim_ads, tmp_path, root=small_ads)
+    config["model"]["candidate_attributes"] = ["category"]
+    inputs = load_ad_inputs(config, load_sim_foundation(sim_ads))
+    catalog = {row["candidate_id"]: row for row in ads_rows(small_ads, "ad_catalog")}
+    vocabulary = inputs.attribute_vocabularies["category"]
+    assert inputs.candidate_attributes == ("category",)
+    for batch in inputs.batches["test"]:
+        for index, (row,) in enumerate(batch.rows):
+            expected = vocabulary.get(json.dumps(catalog[row["candidate_id"]]["category"],
+                                                 ensure_ascii=False), 0)
+            assert batch.candidate_attributes[index, 0].tolist() == [expected]
+
+
+@pytest.mark.parametrize(("change", "match"), [
+    (lambda c: c["model"].update(candidate_attributes=["category", "category"]),
+     "candidate_attributes"),
+    (lambda c: c["model"].update(attribute_dim=0), "attribute_dim"),
+    (lambda c: c["training"].update(encoder_device="tpu"), "encoder_device"),
+])
+def test_sim_attribute_and_device_config_errors_exit_two(sim_ads, tmp_path, change, match):
+    config = sim_config(sim_ads, tmp_path)
+    change(config)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid config must fail before loading")
+
+    with pytest.raises(AdRunError, match=match) as caught:
+        run_ad_optimization(config, AdServices(forbidden, forbidden, forbidden, forbidden))
+    assert caught.value.code == 2
+
+
+def test_user_embeddings_export_covers_every_ads_request(sim_ads, small_ads, tmp_path):
+    import numpy as np
+
+    from src.downstream.user_embeddings import export_user_embeddings
+
+    config = sim_config(sim_ads, tmp_path, root=small_ads)
+    (path,) = export_user_embeddings(config, task="ads", out_dir=tmp_path / "emb",
+                                     inits=["pretrained"])
+    data = np.load(path)
+    rows = ads_rows(small_ads, "ad_opportunities")
+    assert sorted(data["request_id"]) == sorted({row["request_id"] for row in rows})
+    split = dict(zip(data["request_id"], data["split"], strict=True))
+    assert all(split[row["request_id"]] == row["split"] for row in rows)

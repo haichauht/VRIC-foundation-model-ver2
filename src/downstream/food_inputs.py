@@ -15,6 +15,11 @@ from functools import partial
 from pathlib import Path
 
 from src.contracts.output import fingerprint, sha256_file
+from src.downstream.candidate_features import (
+    attribute_names,
+    encode_attributes,
+    fit_attribute_vocabularies,
+)
 from src.downstream.food_samples import (
     MAPPING_VERSION,
     SIM_MAPPING_VERSION,
@@ -77,6 +82,7 @@ class FoodSource:
     rows_of: Callable
     to_sample: Callable
     sim_manifest: dict | None = None
+    catalog: dict | None = None  # merchant_id -> merchants.parquet row (sim_v1)
 
 
 def _meituan_source(config):
@@ -111,7 +117,7 @@ def _sim_source(config):
     return FoodSource(
         records, manifest["dataset_version"], namespace, policy, manifest_sha, provenance,
         SIM_MAPPING_VERSION, SIM_FOOD_CAVEATS, partial(sim_candidate_rows, catalog=catalog),
-        partial(sim_to_canonical_sample, dataset_name=namespace), manifest,
+        partial(sim_to_canonical_sample, dataset_name=namespace), manifest, catalog,
     )
 
 
@@ -391,6 +397,12 @@ def load_food_inputs(config, foundation):
         raise ValueError("Food namespace incompatible with checkpoint; no implicit cross-dataset ID mapping")
     training_ids = sorted({row["candidate_id"] for row in flat_rows if row["split"] == "train"})
     candidate_vocabulary = {candidate: index + 1 for index, candidate in enumerate(training_ids)}
+    names = attribute_names(config.get("model", {}))
+    attribute_vocabularies = None
+    if names:
+        if source.catalog is None:
+            raise ValueError("model.candidate_attributes needs the sim_v1 merchant catalog")
+        attribute_vocabularies = fit_attribute_vocabularies(source.catalog, names, training_ids)
     tokenizer = tokenizer_from_vocabulary(vocabulary)
     sequence = effective_metadata.get("downstream_sequence", effective_metadata.get("sequence"))
     if sequence is None:
@@ -412,7 +424,10 @@ def load_food_inputs(config, foundation):
             candidate_ids[index, :len(rows)] = torch.tensor(
                 [candidate_vocabulary.get(row["candidate_id"], 0) for row in rows], dtype=torch.long
             )
-        batches[split].append(FoodBatch(foundation_collate(samples), candidate_ids, request_rows))
+        attributes = None if not names else encode_attributes(
+            request_rows, source.catalog, names, attribute_vocabularies, candidate_ids.shape[1])
+        batches[split].append(FoodBatch(foundation_collate(samples), candidate_ids, request_rows,
+                                        attributes))
         groups.clear()
 
     requests_by_split = dict.fromkeys(SPLITS, 0)
@@ -454,4 +469,5 @@ def load_food_inputs(config, foundation):
     }
     return FoodInputs(batches, flat_rows, manifest, source.data_sha256,
                       fingerprint(effective_metadata), len(candidate_vocabulary) + 1,
-                      model_config.d_model, candidate_vocabulary, preprocess_metadata=effective_metadata)
+                      model_config.d_model, candidate_vocabulary, preprocess_metadata=effective_metadata,
+                      candidate_attributes=names, attribute_vocabularies=attribute_vocabularies)

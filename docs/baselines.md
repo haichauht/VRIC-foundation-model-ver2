@@ -18,7 +18,9 @@ train/predict tách riêng, tuning search, refit hoặc bootstrap report tổng 
 Config JSON cho `sim-v1` nằm trong configs/baselines: sim_food_b0, sim_food_b1, sim_ads_b0,
 sim_ads_b1 (đúng thiết lập của lần chạy B0/B1 chính thức: B1 train tuần 1–6, early stopping tuần 7,
 đánh giá tuần 8 = split test). Relative paths tính từ thư mục config; các config đọc
-`data_sim/sim-v1/baseline/{food,ads}.json` (tải theo docs/sim_v1_data.md).
+`data_sim/sim-v1/baseline/{food,ads}.json` (tải theo docs/sim_v1_data.md). sim_food_b1f và
+sim_ads_b1f là B1 + đặc trưng foundation (khóa `foundation_features`; embedding xuất bằng
+`python -m src.downstream.user_embeddings`, xem docs/sim_foundation_team_notes.md).
 
 Input canonical JSON có metadata, queries, candidates, labels, history (optional).
 Tên field theo dataclasses ở baseline_input_contract.md; datetime lưu ISO với

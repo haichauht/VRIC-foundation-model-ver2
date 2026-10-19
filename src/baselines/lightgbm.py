@@ -1,4 +1,8 @@
-"""B1 binary classifier with train-only encoding and validation early stopping."""
+"""B1 binary classifier with train-only encoding and validation early stopping.
+
+With ``foundation_features`` (see ``foundation_features.py``) the same model also gets the
+foundation user-embedding features ("B1 + foundation").
+"""
 
 import json
 from datetime import datetime
@@ -12,12 +16,14 @@ from ..evaluation.predictions import PREDICTION_SCHEMA, validate_predictions
 from .contracts import BaselineDataset, ContractError, eligible_history
 from .feature_schema import FeatureEncoder
 from .features import FeatureBuilder
+from .foundation_features import METADATA_FILE, FoundationFeatures
 
 
 class B1Classifier:
     def __init__(self, *, seed: int = 42, n_estimators: int = 200,
                  learning_rate: float = 0.05, num_leaves: int = 31,
-                 min_child_samples: int = 20, stopping_rounds: int = 20) -> None:
+                 min_child_samples: int = 20, stopping_rounds: int = 20,
+                 foundation_features: FoundationFeatures | None = None) -> None:
         if (type(seed) is not int or any(type(v) is not int or v <= 0 for v in
                 (n_estimators, num_leaves, min_child_samples, stopping_rounds))
                 or not 0 < learning_rate <= 1 or num_leaves < 2):
@@ -25,6 +31,7 @@ class B1Classifier:
         self.config = {"seed": seed, "n_estimators": n_estimators, "learning_rate": learning_rate,
                        "num_leaves": num_leaves, "min_child_samples": min_child_samples,
                        "stopping_rounds": stopping_rounds}
+        self.foundation_features = foundation_features
         self.encoder = FeatureEncoder()
         self.booster = None
         self.identity: dict[str, str] = {}
@@ -49,6 +56,10 @@ class B1Classifier:
         train = builder.build(dataset, "train", history_start=history_start)
         valid = builder.build(dataset, "validation", frozen_cutoff=training_cutoff,
                               history_start=history_start)
+        if self.foundation_features is not None:  # fitted on train requests and labels only
+            self.foundation_features.fit(dataset)
+            train = self.foundation_features.extend(train)
+            valid = self.foundation_features.extend(valid)
         labels = {(label.request_id, label.candidate_id): label.target for label in dataset.labels}
         y_train = [labels[(row.request_id, row.candidate_id)] for row in train]
         y_valid = [labels[(row.request_id, row.candidate_id)] for row in valid]
@@ -86,6 +97,8 @@ class B1Classifier:
             raise ContractError("prediction history cutoff precedes training cutoff")
         features = FeatureBuilder().build(dataset, split, frozen_cutoff=frozen_cutoff,
                                           history_start=history_start)
+        if self.foundation_features is not None:
+            features = self.foundation_features.extend(features)
         scores = self.booster.predict(self.encoder.transform(features), num_threads=1)
         if not np.isfinite(scores).all() or not ((scores >= 0) & (scores <= 1)).all():
             raise ContractError("invalid B1 probabilities")
@@ -110,6 +123,8 @@ class B1Classifier:
         path.mkdir(parents=True, exist_ok=False)
         self.encoder.save(path / "encoder.json")
         self.booster.save_model(str(path / "model.txt"))
+        if self.foundation_features is not None:
+            self.foundation_features.save(path)
         (path / "metadata.json").write_text(json.dumps({
             "format_version": 1, "config": self.config, "identity": self.identity,
             "training_cutoff": self.training_cutoff.isoformat(),
@@ -122,7 +137,8 @@ class B1Classifier:
         metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
         if metadata.get("format_version") != 1:
             raise ContractError("unsupported B1 artifact version")
-        model = cls(**metadata["config"])
+        model = cls(**metadata["config"], foundation_features=(
+            FoundationFeatures.load(path) if (path / METADATA_FILE).is_file() else None))
         model.encoder = FeatureEncoder.load(path / "encoder.json")
         model.booster = lgb.Booster(model_file=str(path / "model.txt"))
         if model.booster.feature_name() != list(model.encoder.output_columns):

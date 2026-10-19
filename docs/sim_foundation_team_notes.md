@@ -379,8 +379,8 @@ chạy hết pipeline và ra kết quả khác nhau.
   không có trường 30 ngày), nên so với pretrain, sample Ads thiếu vài token profile
   (`avg_monthly_spend`, `most_used_service`, `ride_count_30d`, `food_order_count_30d`,
   `ad_click_count_30d`, `active_days_30d`). Food đưa đủ profile như pretrain.
-- **Ứng viên Food/Ads chỉ dùng ID** (embedding `candidate_id` học từ train, 0 = OOV); thuộc tính quán/quảng
-  cáo (cuisine, giá, ngành hàng, ...) chưa vào head.
+- Ứng viên Food/Ads mặc định chỉ dùng ID (embedding `candidate_id` học từ train, 0 = OOV); từ ver2 có thể
+  thêm thuộc tính catalog qua `model.candidate_attributes` (mục "Thay đổi trong ver2").
 - `short_term` nhận một phần thông tin user qua attention khi `long_term_injection: "cls"` (mục 2).
 - Kết quả smoke (1 epoch trên `sim-smoke-v1`, 60 quán) chỉ chứng minh pipeline chạy, **không** dùng để kết
   luận pretraining có ích; thí nghiệm thật thuộc dự án con 3 (`sim-v1`, `configs/pretrain_sim_kaggle.yaml`).
@@ -391,3 +391,21 @@ chạy hết pipeline và ra kết quả khác nhau.
 |---|---|---|---|
 | Food (chúng ta), Ads (Người 4) | `src/downstream/head_training.py` (mới), `ad_optimization.py`, `food_recommendation.py` | Head dùng `AdamW` thay `Adam(weight_decay=...)`: L2 gắn vào gradient làm embedding ứng viên hiếm gặp sụp về 0 (Ads: 0,0002 lần ban đầu) | Kết quả downstream đổi: Ads `random` 0,522 → 0,626, Food `epoch3` 0,745 → 0,726 (`docs/sim_pretrain_v1_results.md` mục 6) |
 | Baseline | `src/baselines/features.py` | `FeatureBuilder` đánh chỉ mục history một lần (tuyến tính) thay vì quét lại cho từng ứng viên | Giá trị đặc trưng **không đổi** (test so với thuật toán cũ); B1 trên `sim-v1` full từ hết RAM / quá giờ → 6–7 phút |
+
+## Thay đổi trong ver2 (branch `feat/foundation-features`)
+
+Lý do: chẩn đoán ở `docs/sim_pretrain_v1_results.md` mục 9. Embedding có thông tin; nghẽn nằm ở cách dùng.
+
+| Ai | File | Thay đổi | Ảnh hưởng |
+|---|---|---|---|
+| Food, Ads | `src/downstream/candidate_features.py` (mới), `food_inputs.py`, `ad_inputs.py`, `food_recommendation.py`, `ad_optimization.py` | `model.candidate_attributes`: mỗi thuộc tính catalog có một bảng embedding (vocab fit trên catalog của ứng viên train, 0 = thiếu/chưa gặp), ghép cạnh embedding ID. Food: `merchants.parquet` (`cuisine`, `price_level`, `geohash`, ...); Ads: `ad_catalog.parquet` (`category`, `advertiser`, ...). Chỉ với `data.format: sim_v1` | Mặc định tắt → head và checkpoint head cũ không đổi. Config sim bật sẵn. Head export lưu vocab thuộc tính |
+| Food, Ads | `src/downstream/head_training.py` | `training.encoder_device: cpu \| cuda \| auto`: chỉ `embed_users` chạy trên thiết bị đó, head và batch vẫn ở CPU | Mặc định `cpu` như cũ. Trên Kaggle T4, mã hóa Ads 260.000 request ≈ 2 phút thay vì ≈ 1 giờ 45 phút |
+| Mọi người | `src/downstream/user_embeddings.py` (mới) | CLI xuất embedding theo request (`{task}_{init}.npz` + sidecar `.json`), dùng đúng reader downstream (history < cutoff) | Đầu vào cho B1 + foundation |
+| Baseline | `src/baselines/foundation_features.py` (mới), `lightgbm.py`, `runner.py` | Khóa config `foundation_features` cho B1: 32 thành phần PCA của `[long_term, short_term]` + cosine với nguyên mẫu ứng viên (trung bình embedding các request train mà ứng viên là positive; hàng train bỏ chính request của nó). Fit trên train | B1 không có khóa này không đổi. `run_manifest.json` ghi SHA embedding và provenance |
+
+Chạy B1 + foundation:
+
+```bash
+python -m src.downstream.user_embeddings --task food --config <config Food sim> --out experiments/embeddings --device auto
+python -m src.baselines run --config configs/baselines/sim_food_b1f.json
+```

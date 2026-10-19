@@ -63,7 +63,14 @@ python -m src.downstream.ad_optimization --config configs/ad_optimization_sim.ya
 # 3. Baseline B0/B1 (đọc data_sim/sim-v1/baseline/*.json)
 python -m src.baselines run --config configs/baselines/sim_food_b1.json
 python -m src.baselines run --config configs/baselines/sim_ads_b1.json
+
+# 4. B1 + embedding foundation: xuất embedding theo request rồi chạy B1 có foundation_features
+python -m src.downstream.user_embeddings --task food --config configs/food_recommendation_sim.yaml     --out experiments/embeddings --device auto
+python -m src.baselines run --config configs/baselines/sim_food_b1f.json
 ```
+
+Head Food/Ads trong config sim dùng thêm thuộc tính catalog của ứng viên (`model.candidate_attributes`);
+`training.encoder_device: auto` chạy encoder trên GPU khi có.
 
 Hướng dẫn chạy trên Kaggle và các lưu ý: [docs/sim_foundation_team_notes.md](docs/sim_foundation_team_notes.md).
 

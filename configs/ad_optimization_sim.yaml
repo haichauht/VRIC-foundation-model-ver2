@@ -26,6 +26,9 @@ model:
   hidden_dim: 32
   candidate_dim: 8
   dropout: 0.1
+  # Catalog attributes of each ad (ad_catalog.parquet) next to the ad-ID embedding.
+  candidate_attributes: [category, advertiser]
+  attribute_dim: 8
 training:
   epochs: 10
   learning_rate: 0.001
@@ -35,6 +38,7 @@ training:
   shuffle: true
   initialize_bias_from_train: true
   cpu_threads: 1
+  encoder_device: auto  # embed_users on CUDA when present; the head stays on CPU
 calibration:
   # Enable only to fit on validation and evaluate on a separate test split.
   enabled: false

@@ -345,3 +345,89 @@ def test_checked_in_sim_config():
     assert sim["foundation"] == {"init": "pretrained"}
     assert sim["sequence"] == {"max_tokens": 512, "max_event_count": 30}
     assert "catalog" not in sim and "candidate_policy" not in sim
+
+
+def test_sim_run_with_candidate_attributes_exports_a_reloadable_head(sim_food, tmp_path):
+    from src.downstream.food_recommendation import load_food_ranker_checkpoint
+
+    config = sim_config(sim_food, tmp_path)
+    config["export_model"] = True
+    config["model"].update(candidate_attributes=["cuisine", "price_level", "geohash"],
+                           attribute_dim=3)
+    result = run_food_recommendation(config, FoodServices(evaluator=food_baseline_evaluator(config)))
+    assert {"mrr", "ndcg_at_10"} <= set(result["metrics"])
+    run_dir = Path(result["predictions_path"]).parent
+    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["model_hyperparameters"]["candidate_attributes"] == [
+        "cuisine", "price_level", "geohash"]
+    assert manifest["model_hyperparameters"]["attribute_dim"] == 3
+    ranker, _, payload = load_food_ranker_checkpoint(
+        result["model_path"], expected_foundation_sha256=sha256_file(sim_food.checkpoint),
+        expected_data_version=sim_food.manifest["dataset_version"])
+    catalog = load_merchant_catalog(
+        sim_food.packages.food / "merchants.parquet",
+        sim_food.manifest["files"]["merchants"]["sha256"])
+    cuisines = {json.dumps(row["cuisine"], ensure_ascii=False) for row in catalog.values()}
+    assert set(payload["attribute_vocabularies"]["cuisine"]) <= cuisines
+    assert ranker.attribute_sizes == tuple(
+        len(payload["attribute_vocabularies"][name]) + 1 for name in ("cuisine", "price_level", "geohash"))
+
+
+def test_sim_inputs_carry_catalog_attribute_ids(sim_food, tmp_path):
+    config = sim_config(sim_food, tmp_path)
+    config["model"]["candidate_attributes"] = ["cuisine", "price_level"]
+    inputs = load_food_inputs(config, load_sim_foundation(sim_food))
+    catalog = load_merchant_catalog(
+        sim_food.packages.food / "merchants.parquet",
+        sim_food.manifest["files"]["merchants"]["sha256"])
+    vocabularies = inputs.attribute_vocabularies
+    batch = inputs.batches["test"][0]
+    for index, group in enumerate(batch.rows):
+        for column, row in enumerate(group):
+            merchant = catalog[row["candidate_id"]]
+            assert batch.candidate_attributes[index, column].tolist() == [
+                vocabularies["cuisine"].get(json.dumps(merchant["cuisine"], ensure_ascii=False), 0),
+                vocabularies["price_level"].get(json.dumps(merchant["price_level"]), 0)]
+
+
+@pytest.mark.parametrize(("change", "code", "match"), [
+    (lambda c: c["model"].update(candidate_attributes=["cuisine", "cuisine"]), 2,
+     "candidate_attributes"),
+    (lambda c: c["model"].update(candidate_attributes=["cuisine"], attribute_dim=0), 2,
+     "attribute_dim"),
+    (lambda c: c["training"].update(encoder_device="tpu"), 2, "encoder_device"),
+    (lambda c: c["model"].update(candidate_attributes=["opening_hours"]), 3, "catalog column"),
+])
+def test_sim_attribute_and_device_config_errors(sim_food, tmp_path, change, code, match):
+    config = sim_config(sim_food, tmp_path)
+    change(config)
+    with pytest.raises(FoodRunError, match=match) as caught:
+        run_food_recommendation(config, FoodServices(evaluator=lambda **kwargs: {}))
+    assert caught.value.code == code
+
+
+def test_user_embeddings_export_matches_the_downstream_encoding(sim_food, tmp_path):
+    import numpy as np
+
+    from src.downstream.user_embeddings import export_user_embeddings, main
+
+    config = sim_config(sim_food, tmp_path)
+    paths = export_user_embeddings(config, task="food", out_dir=tmp_path / "emb")
+    pretrained, random_arm = (np.load(path) for path in paths)
+    requests = {record["sample_id"] for record in food_records(sim_food.packages.food)}
+    assert set(pretrained["request_id"]) == requests and len(pretrained["request_id"]) == len(requests)
+    assert pretrained["long_term"].shape == (len(requests), 16)
+    assert not np.allclose(pretrained["short_term"], random_arm["short_term"])
+    meta = json.loads(paths[0].with_suffix(".json").read_text(encoding="utf-8"))
+    assert meta["init"] == "pretrained" and meta["checkpoint_sha256"] == sha256_file(sim_food.checkpoint)
+    foundation = load_sim_foundation(sim_food)
+    batch = load_food_inputs(config, foundation).batches["test"][0]
+    with torch.no_grad():
+        expected = foundation.embed_users(batch.foundation)["long_term"].numpy()
+    rows = [list(pretrained["request_id"]).index(group[0]["request_id"]) for group in batch.rows]
+    assert np.allclose(pretrained["long_term"][rows], expected, atol=1e-6)
+    config_path = tmp_path / "food.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert main(["--task", "food", "--config", str(config_path), "--out", str(tmp_path / "cli"),
+                 "--init", "random", "--device", "tpu"]) == 2
+

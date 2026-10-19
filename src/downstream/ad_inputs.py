@@ -28,6 +28,11 @@ import pyarrow.parquet as pq
 import torch
 
 from src.contracts.output import fingerprint, sha256_file
+from src.downstream.candidate_features import (
+    attribute_names,
+    encode_attributes,
+    fit_attribute_vocabularies,
+)
 from src.downstream.foundation_init import check_sim_checkpoint_binding
 from src.downstream.sim_events import (
     SCENARIOS,
@@ -415,6 +420,13 @@ def load_ad_inputs(config, foundation):
     if not train_ids:
         raise ValueError("Ads requires training exposures")
     candidate_vocabulary = {candidate: index + 1 for index, candidate in enumerate(train_ids)}
+    names = attribute_names(config.get("model", {}))
+    catalog = attribute_vocabularies = None
+    if names:
+        if not fmt.sim:
+            raise ValueError("model.candidate_attributes needs the sim_v1 ad catalog")
+        catalog = {row["candidate_id"]: row for row in tables["ad_catalog"]}
+        attribute_vocabularies = fit_attribute_vocabularies(catalog, names, train_ids)
     tokenizer = _tokenizer(vocabulary)
     sequence = preprocess["sequence"]
     dataset = DatasetConfig(max_tokens=sequence["max_tokens"], max_event_count=sequence["max_event_count"])
@@ -440,7 +452,11 @@ def load_ad_inputs(config, foundation):
             return
         encoded, originals = zip(*groups)
         ids = torch.tensor([[candidate_vocabulary.get(row["candidate_id"], 0)] for row in originals], dtype=torch.long)
-        batches[split].append(AdBatch(foundation_collate(list(encoded)), ids, [[row] for row in originals]))
+        request_rows = [[row] for row in originals]
+        attributes = None if not names else encode_attributes(
+            request_rows, catalog, names, attribute_vocabularies, 1)
+        batches[split].append(AdBatch(foundation_collate(list(encoded)), ids, request_rows,
+                                      candidate_attributes=attributes))
         groups.clear()
 
     for row in sorted(rows, key=lambda row: (row["cutoff_timestamp"], row["request_id"])):
@@ -451,7 +467,8 @@ def load_ad_inputs(config, foundation):
     for split in batches:
         emit(split)
     return AdInputs(batches, rows, manifest, manifest_sha, fingerprint(preprocess),
-                    len(candidate_vocabulary) + 1, model_config.d_model, candidate_vocabulary)
+                    len(candidate_vocabulary) + 1, model_config.d_model, candidate_vocabulary,
+                    names, attribute_vocabularies)
 
 
 def ad_readiness_report(config):

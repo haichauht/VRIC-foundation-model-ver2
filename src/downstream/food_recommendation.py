@@ -26,6 +26,13 @@ from src.contracts.output import (
     utc_now,
     validate_and_write_predictions,
 )
+from src.downstream.candidate_features import (
+    attribute_dim,
+    attribute_names,
+    attribute_sizes,
+    check_candidate_attributes,
+    validate_attribute_vocabularies,
+)
 from src.downstream.food_inputs import (
     food_baseline_evaluator,
     food_data_format,
@@ -34,7 +41,7 @@ from src.downstream.food_inputs import (
 )
 from src.downstream.food_samples import read_sim_food_manifest
 from src.downstream.foundation_init import foundation_init_arm, reinitialize_foundation
-from src.downstream.head_training import head_optimizer
+from src.downstream.head_training import embed_users_on_device, encoder_device, head_optimizer
 
 
 class FoodRunError(ValueError):
@@ -47,11 +54,14 @@ class FoodRanker(nn.Module):
     """Candidate scorer; normalization affects frozen user vectors, not item embeddings.
 
     ``mlp_dot`` adds a low-rank, scaled user/item interaction to the usual MLP.
+    ``attribute_sizes`` adds one embedding table per catalog attribute (0 = missing/unseen); the
+    item vector is then [candidate-ID embedding, attribute embeddings].
     Defaults preserve the parameter names and behavior of previously exported heads.
     """
 
     def __init__(self, d_model, num_candidates, hidden_dim=64, candidate_dim=None, dropout=0.0,
-                 normalization="none", architecture="mlp", interaction_dim=None):
+                 normalization="none", architecture="mlp", interaction_dim=None,
+                 attribute_sizes=(), attribute_dim=8):
         super().__init__()
         candidate_dim = d_model if candidate_dim is None else candidate_dim
         if (min(d_model, num_candidates, hidden_dim, candidate_dim) < 1
@@ -64,12 +74,23 @@ class FoodRanker(nn.Module):
         interaction_dim = candidate_dim if interaction_dim is None else interaction_dim
         if type(interaction_dim) is not int or interaction_dim < 1:
             raise ValueError("interaction_dim must be a positive integer")
+        attribute_sizes = tuple(attribute_sizes)
+        if (not all(type(size) is int and size >= 1 for size in attribute_sizes)
+                or type(attribute_dim) is not int or attribute_dim < 1):
+            raise ValueError("attribute sizes and attribute_dim must be positive integers")
         self.d_model = d_model
         self.normalization = normalization
         self.architecture = architecture
         self.interaction_dim = interaction_dim
+        self.attribute_sizes = attribute_sizes
+        self.attribute_dim = attribute_dim
         self.candidates = nn.Embedding(num_candidates, candidate_dim)
-        layers = [nn.Linear(2 * d_model + candidate_dim, hidden_dim), nn.ReLU()]
+        item_dim = candidate_dim
+        if attribute_sizes:
+            self.attributes = nn.ModuleList(
+                nn.Embedding(size, attribute_dim, padding_idx=0) for size in attribute_sizes)
+            item_dim += attribute_dim * len(attribute_sizes)
+        layers = [nn.Linear(2 * d_model + item_dim, hidden_dim), nn.ReLU()]
         if dropout:
             layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(hidden_dim, 1))
@@ -78,16 +99,18 @@ class FoodRanker(nn.Module):
         self.short_norm = nn.LayerNorm(d_model) if normalization == "layernorm" else nn.Identity()
         if architecture == "mlp_dot":
             self.user_projection = nn.Linear(2 * d_model, interaction_dim, bias=False)
-            self.candidate_projection = nn.Linear(candidate_dim, interaction_dim, bias=False)
+            self.candidate_projection = nn.Linear(item_dim, interaction_dim, bias=False)
 
     def forward(
         self,
         long_term: torch.Tensor,
         short_term: torch.Tensor,
         food_candidate_ids: torch.LongTensor,
+        candidate_attributes: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         if food_candidate_ids.ndim != 2 or food_candidate_ids.dtype != torch.long:
             raise ValueError("food_candidate_ids expected torch.long [B,C]")
+        check_candidate_attributes(candidate_attributes, food_candidate_ids, self.attribute_sizes)
         for name, value in (("long_term", long_term), ("short_term", short_term)):
             if value.shape != (food_candidate_ids.shape[0], self.d_model) or value.dtype != torch.float32:
                 raise ValueError(f"{name}: expected float32 [B,D]")
@@ -101,6 +124,10 @@ class FoodRanker(nn.Module):
             short_term = F.normalize(short_term, p=2, dim=-1)
         count = food_candidate_ids.shape[1]
         candidates = self.candidates(food_candidate_ids)
+        if self.attribute_sizes:
+            candidates = torch.cat([candidates] + [
+                table(candidate_attributes[..., index])
+                for index, table in enumerate(self.attributes)], -1)
         values = torch.cat([long_term[:, None].expand(-1, count, -1),
                             short_term[:, None].expand(-1, count, -1), candidates], -1)
         scores = self.scorer(values).squeeze(-1)
@@ -126,10 +153,14 @@ def load_food_ranker_checkpoint(path, *, expected_foundation_sha256, expected_da
         for key, value in vocabulary.items()
     ) or set(vocabulary.values()) != set(range(1, len(vocabulary) + 1)):
         raise ValueError("Food ranker candidate vocabulary invalid")
+    names = tuple(payload.get("candidate_attributes", ()))
+    vocabularies = payload.get("attribute_vocabularies", {})
+    validate_attribute_vocabularies(names, vocabularies)
     ranker = FoodRanker(payload["d_model"], len(vocabulary) + 1, payload["hidden_dim"],
                         payload.get("candidate_dim", payload["d_model"]), payload.get("dropout", 0.0),
                         payload.get("normalization", "none"), payload.get("architecture", "mlp"),
-                        payload.get("interaction_dim"))
+                        payload.get("interaction_dim"), attribute_sizes(names, vocabularies),
+                        payload.get("attribute_dim", 8))
     ranker.load_state_dict(payload["ranker_state_dict"], strict=True)
     ranker.eval()
     return ranker, vocabulary, payload
@@ -166,6 +197,7 @@ class FoodBatch:
     foundation: object
     candidate_ids: torch.LongTensor
     rows: list
+    candidate_attributes: torch.LongTensor | None = None  # [B,C,K] with model.candidate_attributes
 
     def labels_and_mask(self):
         shape = self.candidate_ids.shape
@@ -202,6 +234,8 @@ class FoodInputs:
     d_model: int
     candidate_vocabulary: dict
     preprocess_metadata: dict | None = None
+    candidate_attributes: tuple = ()
+    attribute_vocabularies: dict | None = None
 
 
 def _validate_food_embeddings(embeddings, batch, d_model):
@@ -258,7 +292,7 @@ def prepare_frozen_embeddings(foundation, inputs, checkpoint_path, splits=("trai
                     raise ValueError(f"Food embedding cache has no batches for {split}")
                 processed = 0
                 for index, batch in enumerate(inputs.batches[split]):
-                    values = foundation.embed_users(batch.foundation)
+                    values = embed_users_on_device(foundation, batch.foundation)
                     _validate_food_embeddings(values, batch, inputs.d_model)
                     embeddings[id(batch)] = {name: value.detach().clone() for name, value in values.items()}
                     batches[id(batch)] = batch
@@ -351,9 +385,13 @@ def run_food_recommendation(config, services=None):
                 raise ValueError(f"{name} must be boolean")
         if training.get("cache_foundation_embeddings", False) and not config.get("freeze_foundation", True):
             raise ValueError("cannot cache foundation embeddings while fine-tuning")
+        names, attributes_dim = attribute_names(model_config), attribute_dim(model_config)
+        device = encoder_device(training.get("encoder_device", "cpu"))
         if services.frozen_embeddings is not None and not config.get("freeze_foundation", True):
             raise ValueError("cannot use frozen embedding cache while fine-tuning")
         data_format = food_data_format(config)
+        if names and data_format != "sim_v1":
+            raise ValueError("model.candidate_attributes needs data.format sim_v1 (merchant catalog)")
         if data_format == "sim_v1":  # policy and catalog come from the package manifest
             for name, present in (("candidate_policy", "candidate_policy" in config),
                                   ("catalog", "catalog" in config),
@@ -426,6 +464,12 @@ def run_food_recommendation(config, services=None):
                         actual[key] = row
         if actual != expected or not all(inputs.batches.get(split) for split in ("train", "validation", config["split"])):
             raise ValueError("Food batches differ from complete handoff")
+        if tuple(inputs.candidate_attributes) != names:
+            raise ValueError("Food inputs candidate attributes differ from model.candidate_attributes")
+        sizes = attribute_sizes(names, inputs.attribute_vocabularies) if names else ()
+        for batches in inputs.batches.values():
+            for batch in batches:
+                check_candidate_attributes(batch.candidate_attributes, batch.candidate_ids, sizes)
     except (ValueError, KeyError, OSError) as error:
         raise FoodRunError(getattr(error, "code", 3), f"{context}: {error}") from error
     model_config = config.get("model", {})
@@ -435,7 +479,8 @@ def run_food_recommendation(config, services=None):
     rank = FoodRanker(inputs.d_model, inputs.num_candidates, model_config.get("hidden_dim", 64),
                       model_config.get("candidate_dim"), model_config.get("dropout", 0.0),
                       model_config.get("normalization", "none"), model_config.get("architecture", "mlp"),
-                      model_config.get("interaction_dim"))
+                      model_config.get("interaction_dim"), sizes, attributes_dim)
+    foundation.to(device)  # only embed_users runs there; the head and batches stay on CPU
     freeze = config.get("freeze_foundation", True)
     for parameter in foundation.parameters():
         parameter.requires_grad_(not freeze)
@@ -456,7 +501,7 @@ def run_food_recommendation(config, services=None):
             for split in ("train", "validation"):  # scored split is encoded after model selection
                 processed = 0
                 for index, batch in enumerate(inputs.batches[split]):
-                    cache[id(batch)] = foundation.embed_users(batch.foundation)
+                    cache[id(batch)] = embed_users_on_device(foundation, batch.foundation)
                     processed += len(batch.rows)
                     if (index + 1) % 100 == 0 or index + 1 == len(inputs.batches[split]):
                         print(f"embedding split={split} processed_requests={processed}", flush=True)
@@ -464,7 +509,7 @@ def run_food_recommendation(config, services=None):
     def embed(batch):
         if id(batch) in cache:
             return cache[id(batch)]
-        return foundation.embed_users(batch.foundation)
+        return embed_users_on_device(foundation, batch.foundation)
 
     logs, best, best_loss, best_epoch, step = [], None, float("inf"), None, 0
     for epoch in range(config["training"]["epochs"]):
@@ -483,7 +528,8 @@ def run_food_recommendation(config, services=None):
                 if set(embedding) != {"long_term", "short_term"}:
                     raise FoodRunError(4, f"{context}: embed_users keys incompatible")
                 with torch.set_grad_enabled(training):
-                    scores = rank(embedding["long_term"], embedding["short_term"], batch.candidate_ids)
+                    scores = rank(embedding["long_term"], embedding["short_term"], batch.candidate_ids,
+                                  batch.candidate_attributes)
                     loss = food_loss(scores, labels, mask)
                     if training:
                         optimizer.zero_grad(set_to_none=True)
@@ -511,7 +557,8 @@ def run_food_recommendation(config, services=None):
     with torch.no_grad():
         for batch in inputs.batches[config["split"]]:
             embedding = embed(batch)
-            scores = rank(embedding["long_term"], embedding["short_term"], batch.candidate_ids)
+            scores = rank(embedding["long_term"], embedding["short_term"], batch.candidate_ids,
+                          batch.candidate_attributes)
             for index, group in enumerate(batch.rows):
                 for column, row in enumerate(group):
                     predictions.append({"schema_version": 1, "task": "food_recommendation",
@@ -540,7 +587,9 @@ def run_food_recommendation(config, services=None):
                                   "normalization": rank.normalization,
                                   "normalization_scope": "long_term_and_short_term_only",
                                   "architecture": rank.architecture,
-                                  "interaction_dim": rank.interaction_dim},
+                                  "interaction_dim": rank.interaction_dim,
+                                  **({"candidate_attributes": list(names),
+                                      "attribute_dim": attributes_dim} if names else {})},
         "training_hyperparameters": dict(training_config),
         "selection": {"metric": "validation_listwise_loss", "best_epoch": best_epoch,
                       "best_validation_loss": best_loss}}
@@ -583,6 +632,9 @@ def run_food_recommendation(config, services=None):
             "candidate_vocabulary": inputs.candidate_vocabulary,
             "ranker_state_dict": rank.state_dict(),
         }
+        if names:
+            payload.update(candidate_attributes=list(names), attribute_dim=attributes_dim,
+                           attribute_vocabularies=inputs.attribute_vocabularies)
         if not freeze:
             payload["foundation_state_dict"] = foundation.state_dict()
         descriptor, temporary = tempfile.mkstemp(prefix=".food-ranker-", suffix=".pt", dir=path.parent)

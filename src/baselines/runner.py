@@ -76,6 +76,12 @@ def prepare(config_path: str | Path) -> tuple[dict, Path, BaselineDataset]:
         raise ContractError("ks requires positive integers")
     if config["zero_positive_policy"] not in {"include", "exclude"}:
         raise ContractError("invalid zero_positive_policy")
+    extra = config.get("foundation_features")
+    if extra is not None and (config["model_kind"] != "B1" or not isinstance(extra, dict)
+                              or not isinstance(extra.get("embeddings"), str)
+                              or not set(extra) <= {"embeddings", "pca_components",
+                                                    "prototype_similarity"}):
+        raise ContractError("foundation_features is a B1 object with embeddings path and options")
     parse_time(config["fit_cutoff"])
     dataset_path = (path.parent / config["dataset_path"]).resolve()
     return config, dataset_path, load_dataset(dataset_path)
@@ -123,7 +129,15 @@ def run(config_path: str | Path, *, validate_only: bool = False) -> dict:
 
             history_start = (parse_time(config["history_start"])
                              if config.get("history_start") else None)
-            model = B1Classifier(**config["parameters"]).fit(
+            foundation_features = None
+            if config.get("foundation_features"):
+                from .foundation_features import FoundationFeatures
+
+                options = dict(config["foundation_features"])
+                foundation_features = FoundationFeatures(
+                    Path(config_path).resolve().parent / options.pop("embeddings"), **options)
+            model = B1Classifier(**config["parameters"],
+                                 foundation_features=foundation_features).fit(
                 dataset, training_cutoff=cutoff, history_start=history_start)
             frozen = parse_time(config["prediction_cutoff"])
             table = model.predict(dataset, config["split"], run_id, frozen_cutoff=frozen,
@@ -166,6 +180,11 @@ def run(config_path: str | Path, *, validate_only: bool = False) -> dict:
                     "seed": config["parameters"].get("seed", 42),
                     "elapsed_seconds": time.perf_counter() - started,
                     "row_count": len(table), "request_count": len(selected), "files": files}
+        if getattr(model, "foundation_features", None) is not None:
+            features = model.foundation_features
+            manifest["foundation"] = {"embeddings_sha256": features.sha256,
+                                      "feature_names": list(features.names),
+                                      "embeddings_provenance": features.provenance}
         if config['model_kind'] in {'B2', 'B3', 'B4'}:
             manifest.update(foundation=model.foundation, resources=model.resources,
                             history_policy='train_prefix_eval_frozen',

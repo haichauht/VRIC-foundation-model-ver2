@@ -52,8 +52,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.downstream.candidate_features import (
+    attribute_dim,
+    attribute_names,
+    attribute_sizes,
+    check_candidate_attributes,
+    validate_attribute_vocabularies,
+)
 from src.downstream.foundation_init import foundation_init_arm, reinitialize_foundation
-from src.downstream.head_training import head_optimizer
+from src.downstream.head_training import embed_users_on_device, encoder_device, head_optimizer
 from src.foundation_input.types import FoundationBatch
 
 TASK = "ad_optimization"
@@ -91,25 +98,41 @@ def is_sha256(value):
 
 
 class AdRanker(nn.Module):
-    """Fuse both user representations and an ad/campaign embedding into logits."""
+    """Fuse both user representations and an ad/campaign embedding into logits.
+
+    ``attribute_sizes`` adds one embedding table per catalog attribute (0 = missing/unseen),
+    concatenated to the ad-ID embedding; without it the head is unchanged.
+    """
 
     def __init__(self, d_model: int, num_candidates: int, hidden_dim: int = 64,
-                 candidate_dim: int | None = None, dropout: float = 0.0):
+                 candidate_dim: int | None = None, dropout: float = 0.0,
+                 attribute_sizes: tuple[int, ...] = (), attribute_dim: int = 8):
         super().__init__()
         candidate_dim = d_model if candidate_dim is None else candidate_dim
         if min(d_model, num_candidates, hidden_dim, candidate_dim) <= 0 or not 0 <= dropout < 1:
             raise ValueError("d_model, num_candidates and hidden_dim must be positive")
+        attribute_sizes = tuple(attribute_sizes)
+        if (not all(type(size) is int and size >= 1 for size in attribute_sizes)
+                or type(attribute_dim) is not int or attribute_dim < 1):
+            raise ValueError("attribute sizes and attribute_dim must be positive integers")
         self.d_model = d_model
+        self.attribute_sizes = attribute_sizes
         # Train-only vocabulary: unknown ads have a neutral, fixed embedding.
         self.candidates = nn.Embedding(num_candidates, candidate_dim, padding_idx=0)
-        layers = [nn.Linear(2 * d_model + candidate_dim, hidden_dim), nn.ReLU()]
+        item_dim = candidate_dim
+        if attribute_sizes:
+            self.attributes = nn.ModuleList(
+                nn.Embedding(size, attribute_dim, padding_idx=0) for size in attribute_sizes)
+            item_dim += attribute_dim * len(attribute_sizes)
+        layers = [nn.Linear(2 * d_model + item_dim, hidden_dim), nn.ReLU()]
         if dropout:
             layers.append(nn.Dropout(dropout))
         self.scorer = nn.Sequential(*layers, nn.Linear(hidden_dim, 1))
 
-    def forward(self, long_term, short_term, ad_candidate_ids):
+    def forward(self, long_term, short_term, ad_candidate_ids, candidate_attributes=None):
         if ad_candidate_ids.ndim != 2 or ad_candidate_ids.dtype != torch.long:
             raise ValueError("ad_candidate_ids: expected torch.long [B,C]")
+        check_candidate_attributes(candidate_attributes, ad_candidate_ids, self.attribute_sizes)
         expected = (ad_candidate_ids.shape[0], self.d_model)
         for name, value in (("long_term", long_term), ("short_term", short_term)):
             if value.shape != expected or value.dtype != torch.float32:
@@ -119,10 +142,14 @@ class AdRanker(nn.Module):
         if ((ad_candidate_ids < 0) | (ad_candidate_ids >= self.candidates.num_embeddings)).any():
             raise ValueError("ad_candidate_ids outside train-fitted vocabulary")
         count = ad_candidate_ids.shape[1]
+        items = [self.candidates(ad_candidate_ids)]
+        if self.attribute_sizes:
+            items += [table(candidate_attributes[..., index])
+                      for index, table in enumerate(self.attributes)]
         features = torch.cat([
             long_term[:, None, :].expand(-1, count, -1),
             short_term[:, None, :].expand(-1, count, -1),
-            self.candidates(ad_candidate_ids),
+            *items,
         ], dim=-1)
         return self.scorer(features).squeeze(-1)
 
@@ -152,6 +179,7 @@ class AdBatch:
     candidate_ids: torch.Tensor
     rows: Sequence[Sequence[Mapping[str, Any]]]
     embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
+    candidate_attributes: torch.Tensor | None = None  # [B,C,K] with model.candidate_attributes
 
     def labels_and_mask(self):
         shape = self.candidate_ids.shape
@@ -188,6 +216,8 @@ class AdInputs:
     num_candidates: int
     d_model: int
     candidate_vocabulary: Mapping[str, int]
+    candidate_attributes: tuple[str, ...] = ()
+    attribute_vocabularies: Mapping[str, Mapping[str, int]] | None = None
 
 
 def build_ad_inputs(opportunities, encoded_requests, *, manifest, data_manifest_sha256,
@@ -298,7 +328,7 @@ def validate_opportunities(rows, manifest, expected_version, exposure_policy, *,
 
 def _embeddings(foundation, batch, freeze):
     with torch.set_grad_enabled(not freeze):
-        embeddings = foundation.embed_users(batch)
+        embeddings = embed_users_on_device(foundation, batch)
     if set(embeddings) != {"long_term", "short_term"}:
         raise AdRunError(4, "embed_users expected exactly long_term and short_term")
     return embeddings["long_term"], embeddings["short_term"]
@@ -308,7 +338,7 @@ def _score(rank, foundation, batch, freeze):
     embeddings = batch.embeddings if freeze and batch.embeddings is not None else _embeddings(
         foundation, batch.foundation, freeze
     )
-    return rank(*embeddings, batch.candidate_ids)
+    return rank(*embeddings, batch.candidate_ids, batch.candidate_attributes)
 
 
 def train_ad_ranker(rank, foundation, batches, *, epochs, learning_rate,
@@ -504,6 +534,10 @@ def _validate_config(config):
         for name in ("evaluate", "export_model"):
             if type(config.get(name, True)) is not bool:
                 raise ValueError(f"{name} must be boolean")
+        if attribute_names(config.get("model", {})) and ad_data_format(config) != "sim_v1":
+            raise ValueError("model.candidate_attributes needs data.format sim_v1 (ad catalog)")
+        attribute_dim(config.get("model", {}))
+        encoder_device(config["training"].get("encoder_device", "cpu"))
     except (KeyError, TypeError, ValueError) as error:
         raise AdRunError(2, f"config field/rule invalid: {error}") from error
 
@@ -551,7 +585,12 @@ def load_ad_ranker_checkpoint(path, *, expected_foundation_sha256, expected_data
     if (not math.isfinite(calibration["temperature"]) or calibration["temperature"] <= 0
             or not math.isfinite(calibration["bias"])):
         raise ValueError("Ads calibration invalid")
-    ranker = AdRanker(payload["d_model"], len(vocabulary) + 1, **payload["model_hyperparameters"])
+    hyperparameters = dict(payload["model_hyperparameters"])
+    names = tuple(hyperparameters.pop("candidate_attributes", ()))
+    vocabularies = payload.get("attribute_vocabularies", {})
+    validate_attribute_vocabularies(names, vocabularies)
+    ranker = AdRanker(payload["d_model"], len(vocabulary) + 1, **hyperparameters,
+                      attribute_sizes=attribute_sizes(names, vocabularies))
     ranker.load_state_dict(payload["ranker_state_dict"], strict=True)
     if not all(torch.isfinite(parameter).all() for parameter in ranker.parameters()):
         raise ValueError("Ads ranker has non-finite weights")
@@ -571,6 +610,8 @@ def _export_ranker(path, rank, foundation, inputs, manifest):
         "ranker_state_dict": rank.state_dict(), "calibration": manifest["calibration"],
         "selection": manifest["selection"], "seed": manifest["seed"],
     }
+    if inputs.candidate_attributes:
+        payload["attribute_vocabularies"] = dict(inputs.attribute_vocabularies)
     if not payload["freeze_foundation"]:
         payload["foundation_state_dict"] = foundation.state_dict()
     descriptor, temporary = tempfile.mkstemp(prefix=".ad-ranker-", suffix=".pt", dir=path.parent)
@@ -678,16 +719,24 @@ def run_ad_optimization(config, services: AdServices):
         for split in ("train", "validation", config["split"]):
             if not inputs.batches.get(split):
                 raise AdRunError(3, f"required {split} exposure batches missing")
+        names = attribute_names(config.get("model", {}))
+        if tuple(inputs.candidate_attributes) != names:
+            raise AdRunError(3, "inputs candidate attributes differ from model.candidate_attributes")
+        sizes = attribute_sizes(names, inputs.attribute_vocabularies) if names else ()
+        for batches in inputs.batches.values():
+            for batch in batches:
+                check_candidate_attributes(batch.candidate_attributes, batch.candidate_ids, sizes)
     except AdRunError as error:
         raise AdRunError(error.code, f"{context}: {error}") from error
     except (ValueError, KeyError, OSError) as error:
         raise AdRunError(3, f"{context}: data handoff invalid: {error}") from error
-    # CPU is the MVP target; loaders must supply CPU FoundationBatch tensors.
-    foundation.cpu()
+    # Loaders supply CPU tensors; only embed_users runs on training.encoder_device.
+    foundation.to(encoder_device(config["training"].get("encoder_device", "cpu")))
     rank = AdRanker(inputs.d_model, inputs.num_candidates,
                     config.get("model", {}).get("hidden_dim", 64),
                     config.get("model", {}).get("candidate_dim"),
-                    config.get("model", {}).get("dropout", 0.0))
+                    config.get("model", {}).get("dropout", 0.0),
+                    sizes, attribute_dim(config.get("model", {})))
     train_rows = [row for row in inputs.opportunities if row["split"] == "train"]
     if config["training"].get("initialize_bias_from_train", False):
         prior = min(1 - 1e-6, max(1e-6, sum(row["clicked"] for row in train_rows) / len(train_rows)))
@@ -758,7 +807,10 @@ def run_ad_optimization(config, services: AdServices):
         "data_limitations": list(inputs.manifest.get("limitations", [])),
         "model_hyperparameters": {"hidden_dim": config.get("model", {}).get("hidden_dim", 64),
                                   "candidate_dim": rank.candidates.embedding_dim,
-                                  "dropout": config.get("model", {}).get("dropout", 0.0)},
+                                  "dropout": config.get("model", {}).get("dropout", 0.0),
+                                  **({"candidate_attributes": list(names),
+                                      "attribute_dim": attribute_dim(config.get("model", {}))}
+                                     if names else {})},
         "training_hyperparameters": dict(config["training"]),
         "selection": {"metric": "validation_ctr_loss", "best_epoch": best_validation["epoch"] + 1,
                       "best_validation_loss": best_validation["ctr_loss"]},
