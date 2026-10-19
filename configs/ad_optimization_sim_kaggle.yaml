@@ -1,0 +1,43 @@
+# Kaggle trio: pairs with configs/pretrain_sim_kaggle.yaml; attach the kernel output
+# hunhthhichu/vric-sim-generate as input (docs/sim_foundation_team_notes.md, "Chạy trên Kaggle").
+contract_version: 1
+seed: 42
+# Simulator Ads package (docs/simulation_data_contract.md "Ads"): events of every service,
+# one served impression per request; train_end/valid_end are exclusive upper bounds.
+data:
+  format: sim_v1
+  root: /kaggle/input/vric-sim-generate/sim-v1/ads
+  expected_version: sim-v1
+# Bound by vocabulary dataset_name == sim_v1 and dataset_provenance.sim_config_sha256 == the
+# Ads manifest's sim_config_sha256 (no checkpoint.expected_version).
+checkpoint:
+  path: /kaggle/working/pretrain_sim/checkpoints/best_checkpoint.pt
+foundation: {init: pretrained}  # random = control arm (checkpoint config, fresh weights)
+freeze_foundation: true
+split: test
+artifact_dir: /kaggle/working/ad_optimization/artifacts
+exposure_policy: sim-served-impression-single-candidate-v1
+missing_click_policy: reject
+export_model: true
+# Label availability comes from events.parquet: click time if clicked, else exposure + 27 s.
+evaluate: true
+evaluation:
+  label_availability_policy: handoff_timestamp
+model:
+  hidden_dim: 32
+  candidate_dim: 8
+  dropout: 0.1
+training:
+  epochs: 10
+  learning_rate: 0.001
+  batch_size: 64
+  weight_decay: 0.0001
+  cache_foundation_embeddings: true
+  shuffle: true
+  initialize_bias_from_train: true
+  cpu_threads: 4
+calibration:
+  # Enable only to fit on validation and evaluate on a separate test split.
+  enabled: false
+  split: validation
+  steps: 100

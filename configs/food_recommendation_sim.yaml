@@ -1,0 +1,28 @@
+contract_version: 1
+seed: 42
+# Local smoke trio: pairs with configs/pretrain_sim.yaml (sim-smoke-v1).
+# Simulator Food package (docs/simulation_data_contract.md "Food"): samples.jsonl and
+# merchants.parquet are pinned by food/manifest.json, which also supplies the candidate policy.
+data:
+  format: sim_v1
+  root: experiments/sim/sim-smoke-v1/food
+  expected_version: sim-smoke-v1
+# Bound by vocabulary dataset_name == sim_v1 and dataset_provenance.sim_config_sha256 == the
+# Food manifest's sim_config_sha256; no Person 3 handoff.
+checkpoint:
+  path: experiments/pretrain_sim/checkpoints/best_checkpoint.pt
+foundation: {init: pretrained}  # random = control arm (checkpoint config, fresh weights)
+freeze_foundation: true
+split: test
+artifact_dir: experiments/food_recommendation/artifacts
+export_model: true
+evaluate: true
+evaluation:
+  item_kind: food
+  label_availability_policy: handoff_timestamp
+  observation_complete_policy: assume_complete_diagnostic
+  ks: [1, 3, 5, 10]
+model: {normalization: l2, architecture: mlp, candidate_dim: 16, hidden_dim: 64, dropout: 0.1}
+training: {epochs: 10, learning_rate: 0.001, batch_size: 16, weight_decay: 0.0001,
+           cache_foundation_embeddings: true, shuffle: true, cpu_threads: 4}
+sequence: {max_tokens: 512, max_event_count: 30}

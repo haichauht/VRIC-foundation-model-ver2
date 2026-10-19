@@ -1,0 +1,17 @@
+{
+  "dataset_path": "../../data_sim/sim-v1/baseline/ads.json",
+  "artifact_dir": "../../experiments/baselines",
+  "model_kind": "B1",
+  "split": "test",
+  "fit_cutoff": "2026-02-16T00:00:00+07:00",
+  "prediction_cutoff": "2026-02-23T00:00:00+07:00",
+  "parameters": {
+    "seed": 42,
+    "n_estimators": 200,
+    "stopping_rounds": 20
+  },
+  "ks": [
+    10
+  ],
+  "zero_positive_policy": "include"
+}

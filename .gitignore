@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local data and artifacts
+data/
+data_sim/
+experiments/**
+!experiments/**/.gitkeep
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.tar.gz
+*.tar
+*.zip
+vric_code.tar.gz
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

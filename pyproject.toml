@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rail-hailing-foundation-model"
+version = "0.1.0"
+description = "Foundation model research project for rail-hailing user behavior."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26.0",
+    "pyarrow>=17.0.0",
+    "torch>=2.2.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+sequence = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+baseline = [
+    # 4.7.0 raises a native access violation in the Windows B1 test run.
+    "lightgbm==4.6.0; sys_platform == 'win32'",
+    "lightgbm>=4.0,<5; sys_platform != 'win32'",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+evaluation = [
+    "scikit-learn>=1.3",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,0 +1,15 @@
+{
+  "dataset_path": "../../data_sim/sim-v1/baseline/ads.json",
+  "artifact_dir": "../../experiments/baselines",
+  "model_kind": "B0",
+  "split": "test",
+  "fit_cutoff": "2026-02-23T00:00:00+07:00",
+  "parameters": {
+    "variant": "ad_ctr",
+    "seed": 42
+  },
+  "ks": [
+    10
+  ],
+  "zero_positive_policy": "include"
+}

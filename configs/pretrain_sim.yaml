@@ -1,0 +1,62 @@
+# Pretraining configuration for the Foundation Model on simulator data (local CPU smoke)
+seed: 42
+dataset_version: "sim-smoke-v1"
+
+# Target dataset: leave null so data_dir is used
+dataset: null  # must stay null so data_dir below selects the sim package
+
+# Data & Output locations (support local paths or gs:// Google Cloud Storage URIs)
+data_dir: "experiments/sim/sim-smoke-v1/pretrain"
+output_dir: "experiments/pretrain_sim"
+vocab_path: null
+
+# Execution device: 'cuda' (for GCP GPU), 'mps' (Apple Silicon), 'cpu', or 'auto'
+device: "cpu"
+
+# Transformer architecture dimensions
+model:
+  d_model: 128
+  num_heads: 4
+  num_layers: 4
+  dropout: 0.1
+  num_user_buckets: 50000
+  categorical_pair_buckets: 100003
+  default_attention_mode: "bidirectional"
+  long_term_injection: "cls"
+  # N(0, 0.02) instead of nn.Embedding's N(0, 1), so pretraining can move long_term (notes §2)
+  user_embedding_init_std: 0.02
+
+# Sequence and token budget configuration
+sequence:
+  max_length: 512
+  max_event_count: 30
+  time_gap_features: true
+
+# Multi-task objective configuration
+objectives:
+  mask_prob: 0.15
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  keep_token_prob: 0.1
+  masked_categorical_weight: 1.0
+  masked_numeric_weight: 1.0
+  next_action_weight: 0.5
+  next_action_prediction: true
+
+# Optimizer and training schedule
+training:
+  batch_size: 16
+  epochs: 1
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  # user_adapter rows update only when their user is in the batch (~10x per epoch): lr x 10
+  user_adapter_lr_multiplier: 10.0
+  grad_clip_norm: 1.0
+  warmup_steps: 50
+  mixed_precision: false
+
+# GCP Specific Options
+gcp:
+  # When running on GCP Vertex AI or Compute Engine, specify your GCS bucket here:
+  # gcs_output_dir: "gs://your-bucket-name/foundation-model/checkpoints"
+  sync_checkpoints_to_gcs: false
