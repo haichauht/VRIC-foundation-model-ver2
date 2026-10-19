@@ -276,3 +276,36 @@ H0 tái lập đúng số downstream chính thức (0,726 / 0,628).
 1. Đưa vào repo: biến thể B1 + đặc trưng foundation (`pca` + `proto`), và thuộc tính ứng viên cho
    head Food/Ads. Lặp 3 seed.
 2. Pretrain v2 (sau): cửa sổ history dài hơn; đánh giá trước bằng probe sở thích chi tiết.
+
+## 10. Kiểm định chính thức trong ver2: bootstrap và 3 seed (2026-10-20)
+
+Code: branch `feat/foundation-features` (`d4ec225`): thuộc tính ứng viên cho head, `encoder_device`,
+`src.downstream.user_embeddings`, B1 với `foundation_features`. Kernel CPU private
+`hunhthhichu/vric-ver2-cpu-{food,ads}`. Mỗi nhánh foundation được mã hóa một lần; mọi lượt head dùng lại
+embedding đó, nên nhánh `random` là cùng một encoder ngẫu nhiên (seed 42) cho cả 3 seed của head.
+Bootstrap ghép cặp: 2.000 lần lấy mẫu lại các request test.
+
+| | Food NDCG@10 | Ads ROC AUC |
+|---|---|---|
+| B1 | 0,7465 | 0,7003 |
+| **B1 + embedding pretrained** | **0,7899** | **0,7092** |
+| chênh so với B1 (KTC 95%) | **+0,0434 [+0,0400; +0,0471]** | **+0,0090 [+0,0044; +0,0135]** |
+| B1 + embedding encoder ngẫu nhiên | 0,7469 | 0,7019 |
+| chênh so với B1 (KTC 95%) | +0,0004 [−0,0011; +0,0020] | +0,0016 [−0,0020; +0,0051] |
+
+Head trên foundation đóng băng, trung bình ± độ lệch chuẩn qua seed 42, 43, 44:
+
+| | Food `pretrained` | Food `random` | Ads `pretrained` | Ads `random` |
+|---|---|---|---|---|
+| H1: ID + thuộc tính ứng viên (config sim hiện tại) | **0,760 ± 0,003** | 0,569 ± 0,003 | **0,678 ± 0,004** | 0,653 ± 0,001 |
+| H0: chỉ ID (head cũ) | 0,725 ± 0,002 | 0,533 ± 0,002 | 0,627 ± 0,002 | 0,627 ± 0,002 |
+
+**Kết luận.**
+- Trên cả hai nhiệm vụ, thêm embedding pretrained vào B1 cải thiện có ý nghĩa thống kê; cùng cách thêm
+  nhưng với encoder ngẫu nhiên thì không. Đây là bằng chứng kiểu Grab rằng pretraining có ích.
+- Food: foundation một mình với head có thuộc tính (0,760) vượt B1 (0,7465).
+- Ads: mức tăng nhỏ hơn nhiều (+0,009 AUC). Foundation một mình (0,678) vẫn dưới B1 (0,700). Head chỉ ID
+  không phân biệt được pretrained với random (0,627 cả hai); khi có thuộc tính ứng viên thì pretrained
+  hơn random +0,025.
+- Kết quả chẩn đoán ở mục 9 được tái lập: Food 0,789 → 0,790, Ads 0,710 → 0,709.
+- Giới hạn: một lần pretrain (seed 42), dữ liệu mô phỏng, chưa so với baseline chuỗi học có giám sát (B2–B4).

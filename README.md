@@ -16,11 +16,12 @@ trong repo đều là `sim_v1`.
 | B0 (phổ biến / CTR quảng cáo) | 0,508 | 0,641 |
 | B1 (LightGBM + đặc trưng) | 0,747 | 0,700 |
 | Foundation đóng băng + head hiện tại | 0,726 | 0,628 |
-| **B1 + embedding foundation** | **0,789** | **0,710** |
-| B1 + embedding encoder ngẫu nhiên (đối chứng) | 0,747 | 0,702 |
+| Foundation đóng băng + head có thuộc tính ứng viên (3 seed) | 0,760 ± 0,003 | 0,678 ± 0,004 |
+| **B1 + embedding foundation** | **0,790** (+0,043, KTC 95% [0,040; 0,047]) | **0,709** (+0,009, KTC 95% [0,004; 0,013]) |
+| B1 + embedding encoder ngẫu nhiên (đối chứng) | 0,747 (+0,000) | 0,702 (+0,002, không có ý nghĩa) |
 
 Pretraining giúp khi embedding được dùng đúng cách; encoder ngẫu nhiên thì không. Chi tiết, chẩn đoán
-và các giới hạn: [docs/sim_pretrain_v1_results.md](docs/sim_pretrain_v1_results.md).
+và các giới hạn: [docs/sim_pretrain_v1_results.md](docs/sim_pretrain_v1_results.md) (mục 9–10).
 
 ## Cài đặt
 
