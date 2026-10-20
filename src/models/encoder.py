@@ -226,6 +226,19 @@ class FoundationModel(nn.Module):
         )
         self.pooler = SequencePooler(sequence_source_id=config.sequence_source_id)
 
+    def long_term_embedding(self, batch: FoundationBatch) -> torch.Tensor:
+        """[B, d_model] float32: the per-ID table, or the MLP over the long-history features."""
+        if self.config.long_term_source != "history":
+            return self.user_adapter(batch.user_ids)
+        features = batch.history_features
+        if features is None or features.shape != (
+                batch.input_ids.shape[0], self.config.history_feature_dim):
+            raise ValueError(
+                "long_term_source history needs batch.history_features "
+                f"[B, {self.config.history_feature_dim}]")
+        # float32 like the ID table's output: under autocast the MLP returns half precision
+        return self.history_encoder(features.float()).float()
+
     def forward(self, batch: FoundationBatch, *, attention_mode: str) -> FoundationOutput:
         if batch.user_ids.ndim != 1 or batch.user_ids.shape[0] != batch.input_ids.shape[0]:
             raise ValueError(
@@ -236,16 +249,7 @@ class FoundationModel(nn.Module):
             raise ValueError(f"user_ids must have dtype=torch.long, got {batch.user_ids.dtype}")
 
         token_features = self.adapters(batch)
-        if self.config.long_term_source == "history":
-            features = batch.history_features
-            if features is None or features.shape != (
-                    batch.input_ids.shape[0], self.config.history_feature_dim):
-                raise ValueError(
-                    "long_term_source history needs batch.history_features "
-                    f"[B, {self.config.history_feature_dim}]")
-            long_term = self.history_encoder(features.to(token_features.dtype))
-        else:
-            long_term = self.user_adapter(batch.user_ids)
+        long_term = self.long_term_embedding(batch)
         if self.config.long_term_injection == "cls":
             token_features = token_features.clone()
             token_features[:, 0, :] = token_features[:, 0, :] + long_term

@@ -89,3 +89,12 @@ def test_history_target_loss_is_masked_and_trains_the_history_encoder():
     none = {"history_targets": targets["history_targets"], "history_target_mask": torch.zeros(2, 2)}
     zero = objectives(model(masked, attention_mode="bidirectional"), mask_targets, batch_targets=none)
     assert zero["history_target_loss"] == 0
+
+
+def test_long_term_stays_float32_under_autocast():
+    # Pretraining runs under CUDA autocast; the MLP's half-precision output must not reach the
+    # float32 contract of long_term (the first sim-v1 v2 run failed exactly here).
+    model = FoundationModel(config()).eval()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        assert model.history_encoder(torch.rand(2, F)).dtype == torch.bfloat16
+        assert model.long_term_embedding(batch(torch.rand(2, F))).dtype == torch.float32
