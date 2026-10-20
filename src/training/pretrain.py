@@ -44,7 +44,7 @@ from src.foundation_input.vocab import (
 from src.models.encoder import FoundationModel, FoundationModelConfig
 from src.models.objectives import PretrainObjectives, PretrainObjectivesConfig
 
-from .checkpoint import save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint
 from .gcp import (
     download_from_gcs,
     get_vertex_ai_environment,
@@ -619,7 +619,24 @@ def pretrain_single_dataset(
     )
 
     # Instantiate Model & Objectives
-    model = FoundationModel(model_config).to(device)
+    model = FoundationModel(model_config)
+    # Warm start: continue from a pretrained encoder (same config and vocabulary); the objective
+    # heads are not stored in checkpoints, so they and the optimizer start fresh.
+    init_from = overrides.get("init_from") or training_cfg.get("init_from")
+    init_from_sha256 = None
+    if init_from:
+        _, init_config, init_vocab, init_payload = load_checkpoint(init_from, load_model=False)
+        if init_config != model_config:
+            raise ValueError("init_from checkpoint has a different model configuration")
+        if (init_vocab.value_to_id != vocabularies.value_to_id
+                or init_vocab.key_to_id != vocabularies.key_to_id):
+            raise ValueError("init_from checkpoint has a different vocabulary; pass its vocab_path")
+        if init_payload.get("preprocess_metadata", {}).get("history_features") !=                 preprocess_metadata.get("history_features"):
+            raise ValueError("init_from checkpoint has a different history feature schema")
+        model.load_state_dict(init_payload["model_state_dict"])
+        init_from_sha256 = hashlib.sha256(Path(init_from).read_bytes()).hexdigest()
+        logger.info("[%s] warm start from %s (sha256 %s)", dataset_key, init_from, init_from_sha256)
+    model = model.to(device)
 
     obj_cfg_dict = config.get("objectives", {})
     objectives_config = PretrainObjectivesConfig(
@@ -852,6 +869,7 @@ def pretrain_single_dataset(
         "model_config": asdict(model_config),
         "objectives_config": asdict(objectives_config),
         "user_adapter_lr_multiplier": user_adapter_lr_multiplier,
+        "init_from": None if not init_from else {"path": str(init_from), "sha256": init_from_sha256},
         "training_history": training_history,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1028,6 +1046,12 @@ def parse_args() -> tuple[dict[str, Any], dict[str, Any]]:
         type=int,
         default=None,
         help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--init_from",
+        type=str,
+        default=None,
+        help="Warm-start the encoder from this checkpoint (same config and vocabulary).",
     )
     parser.add_argument(
         "--smoke",

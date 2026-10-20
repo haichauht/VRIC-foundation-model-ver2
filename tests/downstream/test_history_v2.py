@@ -171,3 +171,26 @@ def test_food_rejects_an_event_log_from_another_simulation(sim_tiny_packages, v2
         expected_sim_config_sha256=manifest(sim_tiny_packages.food)["sim_config_sha256"])
     with pytest.raises(ValueError, match="different simulation"):
         load_food_inputs(config, foundation)
+
+
+def test_pretrain_can_warm_start_from_a_v2_checkpoint(sim_tiny_packages, v2, tmp_path):
+    _, checkpoint = v2
+    vocab = checkpoint.parent.parent / "vocab.json"
+    config = {
+        "seed": 7, "dataset": None, "data_dir": str(sim_tiny_packages.pretrain),
+        "output_dir": str(tmp_path / "more"), "device": "cpu",
+        "model": {"d_model": 16, "num_heads": 2, "num_layers": 1, "dropout": 0.0,
+                  "num_user_buckets": 64, "categorical_pair_buckets": 31,
+                  "long_term_injection": "cls", "long_term_source": "history"},
+        "objectives": {"history_target_weight": 0.5},
+        "sequence": {"max_length": 512, "max_event_count": 30},
+        "training": {"batch_size": 8, "epochs": 1, "learning_rate": 0.0},
+    }
+    record = pretrain(config, {"smoke": True, "vocab_path": str(vocab), "init_from": str(checkpoint)})
+    assert record["init_from"]["path"] == str(checkpoint)
+    start = load_checkpoint(checkpoint)[0].state_dict()
+    after = load_checkpoint(tmp_path / "more" / "checkpoints" / "latest_checkpoint.pt")[0].state_dict()
+    assert all(torch.equal(start[name], after[name]) for name in start)  # lr 0: weights carried over
+    config["model"]["d_model"] = 8
+    with pytest.raises(ValueError, match="different model configuration"):
+        pretrain(config, {"smoke": True, "vocab_path": str(vocab), "init_from": str(checkpoint)})
