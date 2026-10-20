@@ -309,3 +309,59 @@ Head trên foundation đóng băng, trung bình ± độ lệch chuẩn qua seed
   hơn random +0,025.
 - Kết quả chẩn đoán ở mục 9 được tái lập: Food 0,789 → 0,790, Ads 0,710 → 0,709.
 - Giới hạn: một lần pretrain (seed 42), dữ liệu mô phỏng, chưa so với baseline chuỗi học có giám sát (B2–B4).
+
+## 11. Pretrain v2: `long_term` từ lịch sử dài (2026-10-20)
+
+**Vì sao.** Probe trên bộ full cho thấy `long_term` của v1 (bảng theo user ID) không mang thông tin
+gì về user: persona 0,404, loại món 0,243, ngành quảng cáo 0,373, đều bằng mức đoán lớp đa số.
+User ở downstream khớp 100% từ điển, nên không phải lỗi tra cứu: bảng ID thừa, vì user ID đã có
+trong chuỗi đầu vào. Cửa sổ 30 sự kiện thì bỏ mất lịch sử dài: 76% request Ads test không có click
+quảng cáo nào trong cửa sổ.
+
+**Thay đổi** (branch `feat/pretrain-v2`, `9217473`, `8357953`, `15f0f1b`):
+- `long_term = MLP(71 đặc trưng lịch sử dài)` thay cho bảng user ID. Đặc trưng tính từ mọi sự kiện
+  trước thời điểm cắt: log số sự kiện theo dịch vụ và loại, tỷ lệ đơn theo loại món và mức giá,
+  tỷ lệ click/hiển thị và CTR theo ngành quảng cáo, độ gần đây.
+- Mục tiêu phụ (trọng số 0,5): từ `long_term` dự đoán phân phối loại món đã đặt và ngành quảng cáo
+  đã click trong 7 ngày sau thời điểm cắt.
+- Food đọc lịch sử dài từ `events.parquet` của gói Ads cùng bộ mô phỏng (`data.events_root`).
+
+**Pretrain** (`vric-sim-pretrain-v2`, T4, 5 epoch, 2 giờ 35 phút): val loss giảm đều 2,38 → 1,73,
+tốt nhất ở epoch 5. Val loss next-action giảm 0,73 → 0,64; ở v1 nó tăng 0,69 → 1,14. Overfit của
+v1 đến từ việc học thuộc theo user ID.
+
+**Đánh giá** (`vric-sim-v2-eval`, cùng tập test, cùng phương pháp với mục 10):
+
+| | Food NDCG@10 | Ads ROC AUC |
+|---|---|---|
+| B1 | 0,7465 | 0,7003 |
+| B1 + embedding v1 | 0,7899 (+0,043) | 0,7092 (+0,009) |
+| **B1 + embedding v2** | **0,7874 (+0,041 [0,037; 0,045])** | **0,7273 (+0,027 [0,021; 0,034])** |
+| B1 + embedding v2 encoder ngẫu nhiên | 0,7478 (+0,001, không ý nghĩa) | 0,7038 (+0,004, không ý nghĩa) |
+
+Head trên embedding đóng băng (cùng head với thí nghiệm "thử rẻ", 3 seed):
+
+| Head | Food v1 | Food v2 | Ads v1 | Ads v2 |
+|---|---|---|---|---|
+| A: embedding + thuộc tính ứng viên | 0,767 | **0,797** | 0,669 | **0,716** |
+| C: A + thống kê lịch sử + đặc trưng cặp | 0,818 | **0,821** | 0,708 | **0,719** |
+| D: như C, không embedding | 0,783 | 0,785 | 0,717 | 0,718 |
+| E: như C, embedding encoder ngẫu nhiên | 0,785 | 0,786 | 0,713 | 0,713 |
+
+Probe (độ chính xác, 17.652 user; đếm toàn lịch sử: 0,809 / 0,498 / 0,515 / 0,543):
+
+| | Persona | Mức chi tiêu | Loại món | Ngành QC |
+|---|---|---|---|---|
+| `long_term` v1 | 0,404 | 0,452 | 0,243 | 0,373 |
+| `long_term` v2 | 0,930 | 0,583 | 0,546 | 0,579 |
+| `long_term` + `short_term` v2 | **0,968** | **0,763** | **0,569** | **0,594** |
+
+**Kết luận.**
+- `long_term` v2 mang thông tin thật; embedding v2 hơn cách đếm lịch sử ở cả 4 đặc điểm.
+- Ads: B1 + embedding tăng gấp 3 so với v1 (+0,027 so với +0,009), có ý nghĩa thống kê. Foundation
+  một mình (head A) đạt 0,716, vượt B1 (0,700) và ngang head dùng thống kê tay (D, 0,718).
+- Food: foundation một mình 0,797, vượt cả B1 (0,747) lẫn B1 + embedding v1 (0,790).
+- Nhánh encoder ngẫu nhiên của v2 vẫn có MLP trên đặc trưng lịch sử, nên `long_term` ngẫu nhiên
+  cũng mang thông tin (probe persona 0,923). Phần pretraining đóng góp được đo bằng chênh lệch so
+  với nhánh này: B1 + embedding +0,041 (Food) / +0,027 (Ads) so với +0,001 / +0,004.
+- Đang train thêm 5 epoch (warm start, `vric-sim-pretrain-v2b`) vì val loss vẫn giảm ở epoch 5.
