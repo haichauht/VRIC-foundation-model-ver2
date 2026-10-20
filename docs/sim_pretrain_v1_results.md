@@ -364,4 +364,9 @@ Probe (độ chính xác, 17.652 user; đếm toàn lịch sử: 0,809 / 0,498 /
 - Nhánh encoder ngẫu nhiên của v2 vẫn có MLP trên đặc trưng lịch sử, nên `long_term` ngẫu nhiên
   cũng mang thông tin (probe persona 0,923). Phần pretraining đóng góp được đo bằng chênh lệch so
   với nhánh này: B1 + embedding +0,041 (Food) / +0,027 (Ads) so với +0,001 / +0,004.
-- Đang train thêm 5 epoch (warm start, `vric-sim-pretrain-v2b`) vì val loss vẫn giảm ở epoch 5.
+- **Train thêm không giúp.** Train tiếp 5 epoch từ checkpoint epoch 5 (warm start,
+  `vric-sim-pretrain-v2b`; đầu dự đoán và optimizer khởi tạo lại) hạ val loss xuống 1,667 (epoch 9),
+  next-action bắt đầu overfit nhẹ (0,649 → 0,699). Downstream không tốt hơn
+  (`vric-sim-v2b-eval`): Food B1 + embedding 0,782 (+0,035 [0,032; 0,038]) so với 0,787 ở 5 epoch;
+  Ads 0,729 (+0,028) so với 0,727; head A Ads 0,714 so với 0,716; probe không đổi. Bản v2 chính là
+  checkpoint 5 epoch.
