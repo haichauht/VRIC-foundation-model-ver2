@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,7 @@ def _load_user_events(
     validate_parquet_schema(event_path, kind="events", strict_types=True)
     events: dict[str, EventRecord] = {}
     all_event_ids: list[str] = []
+    all_events: list[EventRecord] = []
     try:
         parquet = pq.ParquetFile(event_path)
         for batch in parquet.iter_batches(batch_size=256):
@@ -123,6 +125,7 @@ def _load_user_events(
                         f"got {row.get('user_id')!r}"
                     )
                 all_event_ids.append(event.event_id)
+                all_events.append(event)
                 if event.event_id in needed_event_ids:
                     events[event.event_id] = event
     except ManifestError:
@@ -135,7 +138,7 @@ def _load_user_events(
             f"Event row count mismatch in {event_path}: manifest={expected_rows}, "
             f"actual={len(all_event_ids)}"
         )
-    return events, all_event_ids
+    return events, all_event_ids, all_events
 
 
 def _validate_split_boundary(
@@ -241,8 +244,14 @@ def iter_normalized_samples(
     split: str,
     *,
     validate: bool = True,
+    history_schema: Any | None = None,
 ) -> Iterator[CanonicalSample]:
-    """Yield canonical samples from one logical split without modifying source data."""
+    """Yield canonical samples from one logical split without modifying source data.
+
+    With ``history_schema`` (history_features.HistorySchema) every sample also carries the
+    long-history summary of the user's shard prefix before its cutoff (``history_stop``) and the
+    pretraining targets over the ``target_days`` after the cutoff.
+    """
 
     if split not in {"train", "validation", "test"}:
         raise ValueError(f"Invalid split: {split!r}")
@@ -280,7 +289,14 @@ def iter_normalized_samples(
             for row in snapshot_rows
             for event_id in (row.get("history_event_ids") or [])
         }
-        events, all_event_ids = _load_user_events(manifest, shard, needed_event_ids)
+        events, all_event_ids, all_events = _load_user_events(manifest, shard, needed_event_ids)
+        user_history = None
+        if history_schema is not None:
+            from .history_features import UserHistory, epoch_seconds, history_event_from_record
+
+            user_history = UserHistory(
+                sorted((history_event_from_record(e) for e in all_events), key=lambda e: e.timestamp),
+                history_schema)
         for row in snapshot_rows:
             sample = _sample_from_row(
                 row,
@@ -290,6 +306,13 @@ def iter_normalized_samples(
                 all_event_ids=all_event_ids,
                 requested_split=split,
             )
+            if user_history is not None:
+                cutoff = epoch_seconds(sample.cutoff_time)
+                stop = user_history.stop_before(cutoff, inclusive=sample.cutoff_inclusive)
+                targets, mask = user_history.targets(
+                    stop, cutoff + history_schema.target_days * 86_400)
+                sample = replace(sample, history_features=user_history.features(stop, cutoff),
+                                 history_targets=targets, history_target_mask=mask)
             if sample.split != split:
                 raise ManifestError(f"{sample.sample_id}: requested split does not match row split")
             _validate_split_boundary(row, split=split, manifest=manifest, identity=f"sample_id={sample.sample_id!r}")

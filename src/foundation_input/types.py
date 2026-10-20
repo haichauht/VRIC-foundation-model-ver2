@@ -55,6 +55,10 @@ class EncodedSample:
     records: tuple[TokenRecord, ...]
     user_id_value_id: int | None = None
     next_action_records: tuple[TokenRecord, ...] = ()
+    # Long-history summary (history_features.py); targets/mask only for pretraining samples.
+    history_features: tuple[float, ...] | None = None
+    history_targets: tuple[float, ...] | None = None
+    history_target_mask: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,9 @@ class CanonicalSample:
     events: tuple[EventRecord, ...]
     history_start: int = 0
     history_stop: int = 0
+    history_features: tuple[float, ...] | None = None
+    history_targets: tuple[float, ...] | None = None
+    history_target_mask: tuple[float, ...] | None = None
 
 
 @dataclass
@@ -111,3 +118,4 @@ class FoundationBatch:
     numeric_missing_mask: torch.BoolTensor
     user_ids: torch.LongTensor
     targets: dict[str, torch.Tensor]
+    history_features: torch.FloatTensor | None = None  # [B, F] with long_term_source "history"

@@ -23,6 +23,10 @@ model:
   categorical_pair_buckets: 100003
   default_attention_mode: "bidirectional"
   long_term_injection: "cls"
+  # v2: long_term = MLP over the long-history features (every event before the cutoff), not a
+  # per-user-ID table; set "user_id" to reproduce v1 (docs/sim_pretrain_v1_results.md §11)
+  long_term_source: "history"
+  history_target_days: 7
   # N(0, 0.02) instead of nn.Embedding's N(0, 1), so pretraining can move long_term (notes §2)
   user_embedding_init_std: 0.02
 
@@ -41,6 +45,8 @@ objectives:
   masked_categorical_weight: 1.0
   masked_numeric_weight: 1.0
   next_action_weight: 0.5
+  # v2: predict the next 7 days' order-cuisine / ad-click-category distributions from long_term
+  history_target_weight: 0.5
   next_action_prediction: true
 
 # Optimizer and training schedule

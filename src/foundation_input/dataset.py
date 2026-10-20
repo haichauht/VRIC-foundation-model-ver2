@@ -110,6 +110,9 @@ def encode_sample(
         records=selected,
         user_id_value_id=safe_user_id_value_id,
         next_action_records=next_action_records,
+        history_features=sample.history_features,
+        history_targets=sample.history_targets,
+        history_target_mask=sample.history_target_mask,
     )
 
 
@@ -125,8 +128,10 @@ class FoundationPretrainDataset:
         dataset_config: DatasetConfig | None = None,
         sample_filter: Callable[[Any], bool] | None = None,
         validate: bool = False,
+        history_schema: Any | None = None,
     ) -> None:
         self.dataset_root = dataset_root
+        self.history_schema = history_schema
         self.split = split
         self.artifacts = artifacts
         self.sample_filter = sample_filter
@@ -152,7 +157,8 @@ class FoundationPretrainDataset:
         self.tokenizer_config = tokenizer_config
         self.dataset_config = dataset_config or DatasetConfig()
     def __iter__(self) -> Iterator[EncodedSample]:
-        for sample in iter_normalized_samples(self.dataset_root, self.split, validate=self.validate):
+        for sample in iter_normalized_samples(self.dataset_root, self.split, validate=self.validate,
+                                              history_schema=self.history_schema):
             if self.sample_filter is not None and not self.sample_filter(sample):
                 continue
             try:
@@ -315,6 +321,23 @@ def foundation_collate(
         row + [False] * (max_length - len(row)) for row in numeric_missing_rows
     ]
     tensor = backend.tensor
+    history = [sample.history_features for sample in samples]
+    if any(value is None for value in history) and any(value is not None for value in history):
+        raise ValueError("history features must be present for every sample of a batch or for none")
+    history_tensor = None
+    if history[0] is not None:
+        if len({len(value) for value in history}) != 1:
+            raise ValueError("history feature vectors differ in length within a batch")
+        history_tensor = tensor([list(value) for value in history], dtype=backend.float32)
+    history_targets = {}
+    if any(sample.history_targets is not None for sample in samples):
+        if any(sample.history_targets is None or sample.history_target_mask is None for sample in samples):
+            raise ValueError("history targets must be present for every sample of a batch or for none")
+        history_targets = {
+            "history_targets": tensor([list(s.history_targets) for s in samples], dtype=backend.float32),
+            "history_target_mask": tensor([list(s.history_target_mask) for s in samples],
+                                          dtype=backend.float32),
+        }
     return FoundationBatch(
         input_ids=tensor(padded["input_ids"], dtype=backend.long),
         key_ids=tensor(padded["key_ids"], dtype=backend.long),
@@ -337,6 +360,7 @@ def foundation_collate(
             dtype=backend.long,
         ).reshape(len(samples)),
         targets={
+            **history_targets,
             "event_group_ids": tensor(padded["group_ids"], dtype=backend.long),
             "next_action_type_ids": tensor(next_action_type_ids, dtype=backend.long),
             "next_token": tensor(next_action_type_ids, dtype=backend.long),
@@ -344,4 +368,5 @@ def foundation_collate(
             "next_action_valid_mask": tensor(next_action_valid_mask, dtype=backend.bool),
             "next_token_valid_mask": tensor(next_action_valid_mask, dtype=backend.bool),
         },
+        history_features=history_tensor,
     )

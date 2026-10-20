@@ -27,6 +27,7 @@ from src.foundation_input.dataset import (
     FoundationPretrainDataset,
     foundation_collate,
 )
+from src.foundation_input.history_features import HistorySchemaCollector
 from src.foundation_input.loader import iter_normalized_samples
 from src.foundation_input.manifest import DatasetManifest, load_manifest
 from src.foundation_input.tokenizer import (
@@ -300,6 +301,8 @@ def evaluate(
                 numeric_missing_mask=masked_batch.numeric_missing_mask.to(device),
                 user_ids=masked_batch.user_ids.to(device),
                 targets={k: v.to(device) for k, v in masked_batch.targets.items()},
+                history_features=(None if masked_batch.history_features is None
+                                  else masked_batch.history_features.to(device)),
             )
             targets_dev = {k: v.to(device) for k, v in targets.items()}
 
@@ -534,12 +537,18 @@ def pretrain_single_dataset(
 
     tokenizer_config = tokenizer_config_for_manifest(manifest)
 
-    # Load or fit Vocabulary
+    # Load or fit Vocabulary (and, for long_term_source "history", the history schema in the same pass)
+    wants_history = str(config.get("model", {}).get("long_term_source", "user_id")) == "history"
+    history_collector = HistorySchemaCollector() if wants_history else None
     vocab_path = overrides.get("vocab_path") or config.get("vocab_path")
     if vocab_path and Path(vocab_path).is_file():
         logger.info("[%s] Loading existing vocabulary from %s", dataset_key, vocab_path)
         vocabularies = VocabularyArtifacts.load(vocab_path)
         check_vocab_allowlist(vocabularies, tokenizer_config)
+        if history_collector is not None:
+            samples = iter_normalized_samples(local_data_dir, split=train_split_name, validate=False)
+            for _ in history_collector.watch(s for s in samples if not train_filter or train_filter(s)):
+                pass
     else:
         logger.info("[%s] Fitting vocabulary from training split in %s...", dataset_key, local_data_dir)
         raw_train_samples = iter_normalized_samples(local_data_dir, split=train_split_name, validate=False)
@@ -548,6 +557,8 @@ def pretrain_single_dataset(
             import itertools
             train_samples_stream = itertools.islice(train_samples_stream, max(max_train_samples * 4, 128))
         vocab_config = VocabularyConfig(dataset_name=manifest.dataset_name)
+        if history_collector is not None:
+            train_samples_stream = history_collector.watch(train_samples_stream)
         vocabularies = fit_vocabulary_from_samples(
             train_samples_stream, vocab_config, tokenizer_config
         )
@@ -564,6 +575,14 @@ def pretrain_single_dataset(
 
     # Construct Model Config
     model_cfg_dict = config.get("model", {})
+    long_term_source = str(model_cfg_dict.get("long_term_source", "user_id"))
+    history_schema = None
+    if long_term_source == "history":
+        history_schema = history_collector.schema(
+            target_days=int(model_cfg_dict.get("history_target_days", 7)))
+        preprocess_metadata["history_features"] = history_schema.to_dict()
+        logger.info("[%s] long_term from %d history features (%d cuisines, %d ad categories)",
+                    dataset_key, history_schema.size, *history_schema.target_sizes)
     source_vocab = vocabularies.source_to_id
     modality_vocab = vocabularies.modality_to_id
     seq_source_id = source_vocab.get("sequence", 1)
@@ -589,6 +608,9 @@ def pretrain_single_dataset(
         user_embedding_init_std=(
             None if model_cfg_dict.get("user_embedding_init_std") is None
             else float(model_cfg_dict["user_embedding_init_std"])),
+        long_term_source=long_term_source,
+        history_feature_dim=0 if history_schema is None else history_schema.size,
+        history_target_sizes=() if history_schema is None else history_schema.target_sizes,
     )
     unmaskable_key_ids = (
         (user_id_key_id(vocabularies, tokenizer_config),)
@@ -609,6 +631,7 @@ def pretrain_single_dataset(
         masked_numeric_weight=float(obj_cfg_dict.get("masked_numeric_weight", 1.0)),
         next_action_weight=float(obj_cfg_dict.get("next_action_weight", 0.5)),
         unmaskable_key_ids=unmaskable_key_ids,
+        history_target_weight=float(obj_cfg_dict.get("history_target_weight", 0.0)),
     )
     objectives = PretrainObjectives(model_config, objectives_config).to(device)
 
@@ -637,6 +660,7 @@ def pretrain_single_dataset(
         artifacts=vocabularies,
         dataset_config=dataset_config,
         sample_filter=train_filter,
+        history_schema=history_schema,
     )
     val_dataset = FoundationPretrainDataset(
         dataset_root=str(local_data_dir),
@@ -644,6 +668,7 @@ def pretrain_single_dataset(
         artifacts=vocabularies,
         dataset_config=dataset_config,
         sample_filter=val_filter,
+        history_schema=history_schema,
     )
 
     # Logging setup
@@ -688,6 +713,8 @@ def pretrain_single_dataset(
                 numeric_missing_mask=masked_batch.numeric_missing_mask.to(device),
                 user_ids=masked_batch.user_ids.to(device),
                 targets={k: v.to(device) for k, v in masked_batch.targets.items()},
+                history_features=(None if masked_batch.history_features is None
+                                  else masked_batch.history_features.to(device)),
             )
             targets_dev = {k: v.to(device) for k, v in targets.items()}
 
@@ -717,13 +744,15 @@ def pretrain_single_dataset(
 
             if global_step % 20 == 0:
                 logger.info(
-                    "[%s] Epoch %d | Step %d | Train Loss: %.4f (Masked: %.4f, NextToken: %.4f)",
+                    "[%s] Epoch %d | Step %d | Train Loss: %.4f (Masked: %.4f, NextToken: %.4f, "
+                    "History: %.4f)",
                     dataset_key,
                     epoch,
                     global_step,
                     loss.item(),
                     loss_dict["masked_loss"].item(),
                     loss_dict["next_token_loss"].item(),
+                    loss_dict["history_target_loss"].item(),
                 )
 
         avg_train_loss = epoch_train_loss / max(epoch_batches, 1)

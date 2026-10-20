@@ -7,6 +7,9 @@ data:
   format: sim_v1
   root: experiments/sim/sim-smoke-v1/food
   expected_version: sim-smoke-v1
+  # Every event of every service (Ads package of the same simulation), for checkpoints whose
+  # long_term comes from the long history; ignored by v1 checkpoints.
+  events_root: experiments/sim/sim-smoke-v1/ads
 # Bound by vocabulary dataset_name == sim_v1 and dataset_provenance.sim_config_sha256 == the
 # Food manifest's sim_config_sha256; no Person 3 handoff.
 checkpoint:

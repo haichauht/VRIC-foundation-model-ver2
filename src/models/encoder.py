@@ -36,8 +36,23 @@ class FoundationModelConfig:
     long_term_injection: str = "none"
     # None keeps nn.Embedding's N(0, 1) init (old checkpoints, defaults); a float draws N(0, std).
     user_embedding_init_std: float | None = None
+    # "user_id": long_term = per-ID table (UserIdAdapter); "history": long_term = MLP over the
+    # long-history features of the batch (foundation_input/history_features.py).
+    long_term_source: str = "user_id"
+    history_feature_dim: int = 0
+    # Output sizes of the pretraining history-target heads (order cuisines, ad-click categories).
+    history_target_sizes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.long_term_source not in {"user_id", "history"}:
+            raise ValueError(
+                f"long_term_source must be user_id or history, got {self.long_term_source!r}")
+        if (type(self.history_feature_dim) is not int or self.history_feature_dim < 0
+                or (self.long_term_source == "history") != (self.history_feature_dim > 0)):
+            raise ValueError("history_feature_dim must be positive exactly when long_term_source is history")
+        object.__setattr__(self, "history_target_sizes", tuple(self.history_target_sizes))
+        if not all(type(size) is int and size >= 0 for size in self.history_target_sizes):
+            raise ValueError("history_target_sizes must be nonnegative integers")
         if self.long_term_injection not in {"none", "cls"}:
             raise ValueError(
                 f"long_term_injection must be none or cls, got {self.long_term_injection!r}"
@@ -192,6 +207,12 @@ class FoundationModel(nn.Module):
             d_model=config.d_model,
             init_std=config.user_embedding_init_std,
         )
+        if config.long_term_source == "history":
+            self.history_encoder = nn.Sequential(
+                nn.Linear(config.history_feature_dim, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
         layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.num_heads,
@@ -215,7 +236,16 @@ class FoundationModel(nn.Module):
             raise ValueError(f"user_ids must have dtype=torch.long, got {batch.user_ids.dtype}")
 
         token_features = self.adapters(batch)
-        long_term = self.user_adapter(batch.user_ids)
+        if self.config.long_term_source == "history":
+            features = batch.history_features
+            if features is None or features.shape != (
+                    batch.input_ids.shape[0], self.config.history_feature_dim):
+                raise ValueError(
+                    "long_term_source history needs batch.history_features "
+                    f"[B, {self.config.history_feature_dim}]")
+            long_term = self.history_encoder(features.to(token_features.dtype))
+        else:
+            long_term = self.user_adapter(batch.user_ids)
         if self.config.long_term_injection == "cls":
             token_features = token_features.clone()
             token_features[:, 0, :] = token_features[:, 0, :] + long_term

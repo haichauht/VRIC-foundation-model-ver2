@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from pathlib import Path
 
@@ -36,6 +36,7 @@ from src.downstream.food_samples import (
 )
 from src.downstream.foundation_init import check_sim_checkpoint_binding
 from src.foundation_input.dataset import DatasetConfig, encode_sample, foundation_collate
+from src.foundation_input.history_features import epoch_seconds
 from src.foundation_input.tokenizer import TokenizerConfig
 from src.foundation_input.validation import validate_sample
 from src.training.checkpoint import load_checkpoint
@@ -152,7 +153,9 @@ def _read_person3_handoff(path, expected_version, handoff):
 
 # FoundationModelConfig fields added after the Person 3 record format was frozen (branch
 # feat/sim-foundation); only these may be absent from a record.
-_POST_RECORD_MODEL_FIELDS = frozenset({"long_term_injection", "user_embedding_init_std"})
+_POST_RECORD_MODEL_FIELDS = frozenset({"long_term_injection", "user_embedding_init_std",
+                                       "long_term_source", "history_feature_dim",
+                                       "history_target_sizes"})
 
 
 def _record_matches_model_config(recorded, model_config):
@@ -161,8 +164,11 @@ def _record_matches_model_config(recorded, model_config):
         return False
     actual = asdict(model_config)
     defaults = {item.name: item.default for item in fields(model_config)}
+    def plain(value):  # JSON records hold lists where the config holds tuples
+        return list(value) if isinstance(value, tuple) else value
+
     return set(recorded) <= set(actual) and all(
-        recorded[name] == value if name in recorded
+        plain(recorded[name]) == plain(value) if name in recorded
         else name in _POST_RECORD_MODEL_FIELDS and value == defaults[name]
         for name, value in actual.items()
     )
@@ -403,6 +409,20 @@ def load_food_inputs(config, foundation):
         if source.catalog is None:
             raise ValueError("model.candidate_attributes needs the sim_v1 merchant catalog")
         attribute_vocabularies = fit_attribute_vocabularies(source.catalog, names, training_ids)
+    histories = None
+    history_metadata = checkpoint.get("preprocess_metadata", {}).get("history_features")
+    if history_metadata is not None:
+        from src.downstream.sim_events import read_event_log, user_histories
+        from src.foundation_input.history_features import HistorySchema
+
+        if source.sim_manifest is None or not config["data"].get("events_root"):
+            raise ValueError("history-feature checkpoints need data.format sim_v1 and data.events_root "
+                             "(the same simulation's Ads package, whose events.parquet has every event)")
+        events_by_user, events_sha = read_event_log(
+            config["data"]["events_root"],
+            expected_sim_config_sha256=source.sim_manifest["sim_config_sha256"])
+        histories = user_histories(events_by_user, HistorySchema.from_dict(history_metadata))
+        effective_metadata = {**effective_metadata, "history_events_sha256": events_sha}
     tokenizer = tokenizer_from_vocabulary(vocabulary)
     sequence = effective_metadata.get("downstream_sequence", effective_metadata.get("sequence"))
     if sequence is None:
@@ -437,6 +457,13 @@ def load_food_inputs(config, foundation):
     for record, rows in requests:
         split = rows[0]["split"]
         sample = validate_sample(source.to_sample(record))
+        if histories is not None:
+            history = histories.get(sample.user_id)
+            if history is None:
+                raise ValueError(f"request_id={record['sample_id']}: user missing from data.events_root")
+            cutoff = epoch_seconds(sample.cutoff_time)
+            sample = replace(sample, history_features=history.features(
+                history.stop_before(cutoff, inclusive=sample.cutoff_inclusive), cutoff))
         encoded = encode_sample(sample, vocabulary, tokenizer, dataset)
         known = encoded.user_id_value_id is not None
         requests_by_split[split] += 1

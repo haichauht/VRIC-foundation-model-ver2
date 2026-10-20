@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from bisect import bisect_left
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -40,6 +40,7 @@ from src.downstream.sim_events import (
     SIM_DATASET_NAME,
     ads_window_events,
     sim_canonical_sample,
+    user_histories,
 )
 from src.foundation_input.dataset import DatasetConfig, encode_sample, foundation_collate
 from src.foundation_input.tokenizer import TokenizerConfig
@@ -410,6 +411,8 @@ def load_ad_inputs(config, foundation):
     preprocess = checkpoint["preprocess_metadata"]
     if model_config != foundation.config:
         raise ValueError("Ads checkpoint/model configuration mismatch")
+    if "history_features" in preprocess and not fmt.sim:
+        raise ValueError("history-feature checkpoints need the sim_v1 Ads package (full event log)")
     if not fmt.sim:  # Taobao: the vocabulary was fitted on this very handoff
         if preprocess.get("source_manifest_sha256") != manifest_sha:
             raise ValueError("Ads handoff manifest differs from checkpoint preprocessing source")
@@ -432,8 +435,14 @@ def load_ad_inputs(config, foundation):
     dataset = DatasetConfig(max_tokens=sequence["max_tokens"], max_event_count=sequence["max_event_count"])
     if dataset.max_tokens != model_config.max_length:
         raise ValueError("Ads checkpoint sequence/model length mismatch")
+    histories = None
     if fmt.sim:
         events_by_user, _ = _index_sim_events(tables)
+        if "history_features" in preprocess:
+            from src.foundation_input.history_features import HistorySchema
+
+            histories = user_histories(events_by_user,
+                                       HistorySchema.from_dict(preprocess["history_features"]))
         profiles = {row["user_id"]: row for row in tables["profiles"]}
         to_sample = partial(_sim_canonical, manifest=manifest, events_by_user=events_by_user,
                             profiles=profiles)
@@ -461,6 +470,10 @@ def load_ad_inputs(config, foundation):
 
     for row in sorted(rows, key=lambda row: (row["cutoff_timestamp"], row["request_id"])):
         sample = to_sample(row)
+        if histories is not None:  # every event before the cutoff = the first history_stop rows
+            history = histories[row["user_id"]]
+            sample = replace(sample, history_features=history.features(
+                row["history_stop"], row["cutoff_timestamp"]))
         pending[row["split"]].append((encode_sample(sample, vocabulary, tokenizer, dataset), row))
         if len(pending[row["split"]]) >= batch_size:
             emit(row["split"])

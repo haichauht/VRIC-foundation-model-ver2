@@ -14,6 +14,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from src.foundation_input.types import CanonicalSample, EventRecord
@@ -185,3 +186,55 @@ def sim_canonical_sample(
         profile=profile,
         events=sim_event_records(events),
     )
+
+
+# ---- long-history features for the sim packages (checkpoints with long_term_source "history") ----
+
+_CONTEXT_TYPES = frozenset({"order", "ad_impression", "ad_click"})  # the only ones the summary reads
+
+
+def history_event(row):
+    """``HistoryEvent`` of an ``events.parquet`` row; context parsed only where the summary needs it."""
+    from src.foundation_input.history_features import HistoryEvent
+
+    context = {}
+    if row.get("event_type") in _CONTEXT_TYPES and row.get("attributes_json"):
+        context = json.loads(row["attributes_json"])
+    return HistoryEvent(int(row["timestamp"]), row.get("service"), row.get("event_type"), context)
+
+
+def user_histories(events_by_user, schema):
+    """``UserHistory`` per user from time-ordered ``events.parquet`` rows (Ads reader index)."""
+    from src.foundation_input.history_features import UserHistory
+
+    return {user: UserHistory([history_event(row) for row in rows], schema)
+            for user, rows in events_by_user.items()}
+
+
+def read_event_log(root, *, expected_sim_config_sha256):
+    """Every event of every user from a sim Ads package (``events.parquet``, SHA-256 checked),
+    grouped per user in (timestamp, source_row_index) order. Food reads its long history here."""
+    import hashlib
+
+    import pyarrow.parquet as pq
+
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("sim_config_sha256") != expected_sim_config_sha256:
+        raise ValueError("data.events_root comes from a different simulation (sim_config_sha256)")
+    entry = manifest["files"]["events"]
+    path = root / entry["path"]
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != entry["sha256"]:
+        raise ValueError(f"{path}: checksum mismatch")
+    table = pq.read_table(path, columns=["user_id", "timestamp", "source_row_index", "service",
+                                         "event_type", "attributes_json"]).to_pylist()
+    by_user = {}
+    for row in table:
+        by_user.setdefault(row["user_id"], []).append(row)
+    for rows in by_user.values():
+        rows.sort(key=lambda row: (row["timestamp"], row["source_row_index"]))
+    return by_user, entry["sha256"]

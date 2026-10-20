@@ -28,6 +28,9 @@ class PretrainObjectivesConfig:
     next_action_weight: float = 0.5
     next_token_weight: float | None = None
     unmaskable_key_ids: tuple[int, ...] = ()
+    # Weight of predicting the post-cutoff order-cuisine / ad-click-category distributions from
+    # long_term (needs model_config.history_target_sizes and batch history targets).
+    history_target_weight: float = 0.0
 
 
 class MaskingPolicy:
@@ -120,6 +123,7 @@ class MaskingPolicy:
             numeric_missing_mask=masked_numeric_missing,
             user_ids=batch.user_ids,
             targets=batch.targets,
+            history_features=batch.history_features,
         )
 
         targets = {
@@ -161,6 +165,11 @@ class PretrainObjectives(nn.Module):
         self.next_action_head = nn.Linear(
             model_config.d_model, model_config.value_vocab_size, bias=True
         )
+
+        # Head 4: future preference distributions from the long-term embedding
+        self.history_target_sizes = tuple(model_config.history_target_sizes)
+        if sum(self.history_target_sizes) > 0:
+            self.history_target_head = nn.Linear(model_config.d_model, sum(self.history_target_sizes))
 
     def forward(
         self,
@@ -236,6 +245,26 @@ class PretrainObjectives(nn.Module):
                 next_action_loss = F.cross_entropy(action_logits, action_labels)
                 next_action_correct = (action_logits.argmax(dim=-1) == action_labels).float().mean()
 
+        # 4. History targets: soft cross-entropy per target group, masked when the window is empty
+        history_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        if (sum(self.history_target_sizes) > 0 and batch_targets is not None
+                and "history_targets" in batch_targets):
+            logits = self.history_target_head(output.long_term).float()
+            targets_all = batch_targets["history_targets"].float()
+            mask = batch_targets["history_target_mask"].float()
+            offset, terms, weight = 0, [], 0.0
+            for group, size in enumerate(self.history_target_sizes):
+                if size == 0:
+                    continue
+                part = slice(offset, offset + size)
+                offset += size
+                log_p = F.log_softmax(logits[:, part], dim=-1)
+                per_sample = -(targets_all[:, part] * log_p).sum(-1)
+                terms.append((per_sample * mask[:, group]).sum())
+                weight += float(mask[:, group].sum())
+            if weight > 0:
+                history_loss = torch.stack(terms).sum() / weight
+
         # Total weighted loss
         action_weight = (
             self.objectives_config.next_token_weight
@@ -246,6 +275,7 @@ class PretrainObjectives(nn.Module):
             self.objectives_config.masked_categorical_weight * cat_loss
             + self.objectives_config.masked_numeric_weight * num_loss
             + action_weight * next_action_loss
+            + self.objectives_config.history_target_weight * history_loss
         )
 
         return {
@@ -258,5 +288,6 @@ class PretrainObjectives(nn.Module):
             "next_token_accuracy": next_action_correct,
             "next_action_loss": next_action_loss,
             "next_action_accuracy": next_action_correct,
+            "history_target_loss": history_loss,
             "num_masked_tokens": torch.tensor(num_cat_masked + num_numeric_masked, device=device),
         }

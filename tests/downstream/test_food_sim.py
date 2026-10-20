@@ -340,7 +340,8 @@ def test_sim_config_sequence_must_match_the_checkpoint(sim_food, tmp_path):
 def test_checked_in_sim_config():
     sim = yaml.safe_load(Path("configs/food_recommendation_sim.yaml").read_text(encoding="utf-8"))
     assert sim["data"] == {"format": "sim_v1", "root": "experiments/sim/sim-smoke-v1/food",
-                           "expected_version": "sim-smoke-v1"}
+                           "expected_version": "sim-smoke-v1",
+                           "events_root": "experiments/sim/sim-smoke-v1/ads"}
     assert sim["checkpoint"] == {"path": "experiments/pretrain_sim/checkpoints/best_checkpoint.pt"}
     assert sim["foundation"] == {"init": "pretrained"}
     assert sim["sequence"] == {"max_tokens": 512, "max_event_count": 30}
